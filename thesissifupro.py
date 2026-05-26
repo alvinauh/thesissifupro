@@ -43,6 +43,7 @@ from reportlab.platypus import (
 )
 
 import google.generativeai as genai
+import anthropic
 
 # ─── Config ───────────────────────────────────────────────────
 app = FastAPI(title="PhD Supervisor Audit System")
@@ -55,13 +56,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-api_key = os.environ.get("GEMINI_API_KEY")
-if api_key:
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+# ── Gemini Flash Lite — classification only (fast, cheap ~$0.001/call) ──
+gemini_key = os.environ.get("GEMINI_API_KEY")
+if gemini_key:
+    genai.configure(api_key=gemini_key)
+    gemini_classifier = genai.GenerativeModel("gemini-2.5-flash-lite-preview-06-17")
 else:
-    model = None
-    print("WARNING: GEMINI_API_KEY not set — AI calls will be skipped.")
+    gemini_classifier = None
+    print("WARNING: GEMINI_API_KEY not set — classification will use fallback.")
+
+# ── Claude Sonnet 4.6 — audit only (deep reasoning, ~$0.10/call) ──
+anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+if anthropic_key:
+    claude_client = anthropic.AsyncAnthropic(api_key=anthropic_key)
+else:
+    claude_client = None
+    print("WARNING: ANTHROPIC_API_KEY not set — audit will be skipped.")
 
 W, H = A4
 BLACK   = colors.HexColor("#111111")
@@ -141,12 +151,12 @@ async def classify_document(text: str) -> dict:
         "authors": "UNKNOWN",
         "field": "UNKNOWN"
     }
-    if not model or not text.strip():
+    if not gemini_classifier or not text.strip():
         return default
     try:
         excerpt = text[:6000]
         prompt = CLASSIFICATION_PROMPT.format(text=excerpt)
-        response = await model.generate_content_async(prompt)
+        response = await gemini_classifier.generate_content_async(prompt)
         raw = response.text.strip()
         # Strip markdown fences if present
         raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
@@ -372,20 +382,20 @@ VERDICT_COLORS = {
 
 
 async def run_audit(doc_type: str, text: str) -> str:
-    if not model:
-        return "AI model not available. Please set GEMINI_API_KEY."
+    if not claude_client:
+        return "AI model not available. Please set ANTHROPIC_API_KEY."
     prompt_template = PROMPT_MAP.get(doc_type, MASTERS_PROMPT)
     prompt = prompt_template.format(text=text[:20000])
     try:
-        response = await model.generate_content_async(
-            prompt,
-            generation_config={"temperature": 0.3, "max_output_tokens": 8192},
-            safety_settings=[
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            ]
+        # Claude Sonnet 4.6 — deep academic reasoning for the audit output
+        message = await claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=8192,
+            temperature=0.3,
+            system=AUDIT_SYSTEM,
+            messages=[{"role": "user", "content": prompt}]
         )
-        return response.text.strip()
+        return message.content[0].text.strip()
     except Exception as e:
         print(f"Audit AI error: {e}")
         return f"Audit could not be completed: {e}"
@@ -749,6 +759,7 @@ async def audit_document(file: UploadFile = File(...)):
 async def health():
     return {
         "status": "ok",
-        "ai_available": model is not None,
+        "classifier_available": gemini_classifier is not None,
+        "audit_model_available": claude_client is not None,
         "version": "2.0.0"
     }
