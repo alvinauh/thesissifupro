@@ -556,10 +556,9 @@ def _get_or_create_comments_part(doc):
             return rel.target_part
             
     # 2. Create new part and bind it natively so it saves correctly
-    xml_str = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
-    )
+    # 2. Create new part and bind it natively so it saves correctly
+    # Note: No <?xml...?> declaration here to prevent lxml ValueError
+    xml_str = '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
     element = parse_xml(xml_str)
     uri = PackURI('/word/comments.xml')
     ct = 'application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml'
