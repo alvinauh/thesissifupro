@@ -32,7 +32,9 @@ from typing import Optional
 import pypdf
 from docx import Document as DocxDocument
 from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
+from docx.oxml import OxmlElement, parse_xml
+from docx.parts.xmlpart import XmlPart
+from docx.opc.packuri import PackURI
 from lxml import etree
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -545,54 +547,54 @@ def build_examiner_pdf(filename, audit_id, doc_type, clf, examiner_text, chs) ->
 
 # ── Output 2: Annotated DOCX ───────────────────────────────────
 def _get_or_create_comments_part(doc):
-    """Safely retrieves the existing comments part or creates it if missing."""
-    from docx.opc.part import Part
-    from docx.opc.packuri import PackURI
-    
+    """Safely retrieves the existing comments part or creates it using native python-docx."""
     comments_reltype = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments'
     
-    # 1. Return existing part if it's already in the document's relationships
+    # 1. Return existing part if it's already there
     for rel in doc.part.rels.values():
         if rel.reltype == comments_reltype:
             return rel.target_part
             
-    # 2. Otherwise, create a new one
+    # 2. Create new part and bind it natively so it saves correctly
     xml_str = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
     )
+    element = parse_xml(xml_str)
     uri = PackURI('/word/comments.xml')
-    ct  = 'application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml'
-    cp  = Part(uri, ct, xml_str.encode(), doc.part.package)
+    ct = 'application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml'
+    
+    cp = XmlPart(uri, ct, element, doc.part.package)
     doc.part.relate_to(cp, comments_reltype)
     return cp
 
 
 def _insert_comment(doc, para, cid, author, text, date_str):
-    """Insert a Word comment safely without duplicating the XML parts."""
-    W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-
-    # Safely get or create the comments part (only creates it once per document)
+    """Insert a Word comment safely using pure python-docx OxmlElements."""
     cp = _get_or_create_comments_part(doc)
-    root = etree.fromstring(cp.blob)
+    comments_root = cp.element
 
-    # Add <w:comment> element
-    comment_el = etree.SubElement(root, f'{{{W_NS}}}comment')
-    comment_el.set(f'{{{W_NS}}}id',       str(cid))
-    comment_el.set(f'{{{W_NS}}}author',   author)
-    comment_el.set(f'{{{W_NS}}}date',     date_str)
-    comment_el.set(f'{{{W_NS}}}initials', 'TS')
+    # 1. Build the comment element
+    comment_el = OxmlElement('w:comment')
+    comment_el.set(qn('w:id'), str(cid))
+    comment_el.set(qn('w:author'), author)
+    comment_el.set(qn('w:date'), date_str)
+    comment_el.set(qn('w:initials'), 'TS')
     
-    p_el = etree.SubElement(comment_el, f'{{{W_NS}}}p')
-    r_el = etree.SubElement(p_el,       f'{{{W_NS}}}r')
-    t_el = etree.SubElement(r_el,       f'{{{W_NS}}}t')
+    p_el = OxmlElement('w:p')
+    r_el = OxmlElement('w:r')
+    t_el = OxmlElement('w:t')
     t_el.text = text
-    t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+    t_el.set(qn('xml:space'), 'preserve')
     
-    # Write changes back to the part's blob
-    cp._blob = etree.tostring(root, xml_declaration=True, encoding='UTF-8', standalone=True)
+    r_el.append(t_el)
+    p_el.append(r_el)
+    comment_el.append(p_el)
+    
+    # Append to the actual python-docx cached tree!
+    comments_root.append(comment_el)
 
-    # Add markers to the original paragraph's XML
+    # 2. Add markers to the original paragraph's XML
     px = para._p
     
     crs = OxmlElement('w:commentRangeStart')
@@ -644,15 +646,14 @@ def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
                 doc.add_paragraph(cleaned)
     date_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
     
-    # Scan for existing comments to prevent Word corruption from duplicate IDs
+    # Scan for existing comments properly using python-docx's xpath
     cp = _get_or_create_comments_part(doc)
-    root = etree.fromstring(cp.blob)
-    W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-    existing_ids = [
-        int(el.get(f'{{{W_NS}}}id')) 
-        for el in root.findall(f'.//{{{W_NS}}}comment') 
-        if el.get(f'{{{W_NS}}}id') is not None
-    ]
+    existing_ids = []
+    for comment in cp.element.xpath('.//w:comment'):
+        c_id = comment.get(qn('w:id'))
+        if c_id is not None:
+            existing_ids.append(int(c_id))
+            
     cid = max(existing_ids) + 1 if existing_ids else 0
 
     # Build excerpt → comment lookup
