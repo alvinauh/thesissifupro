@@ -544,53 +544,77 @@ def build_examiner_pdf(filename, audit_id, doc_type, clf, examiner_text, chs) ->
 
 
 # ── Output 2: Annotated DOCX ───────────────────────────────────
+def _get_or_create_comments_part(doc):
+    """Safely retrieves the existing comments part or creates it if missing."""
+    from docx.opc.part import Part
+    from docx.opc.packuri import PackURI
+    
+    comments_reltype = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments'
+    
+    # 1. Return existing part if it's already in the document's relationships
+    for rel in doc.part.rels.values():
+        if rel.reltype == comments_reltype:
+            return rel.target_part
+            
+    # 2. Otherwise, create a new one
+    xml_str = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
+    )
+    uri = PackURI('/word/comments.xml')
+    ct  = 'application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml'
+    cp  = Part(uri, ct, xml_str.encode(), doc.part.package)
+    doc.part.relate_to(cp, comments_reltype)
+    return cp
+
+
 def _insert_comment(doc, para, cid, author, text, date_str):
-    """Insert a Word comment on a paragraph using lxml."""
+    """Insert a Word comment safely without duplicating the XML parts."""
     W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 
-    # Get or create comments part
-    try:
-        cp = doc.part.comments
-        root = etree.fromstring(cp._blob)
-    except Exception:
-        xml_str = (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
-        )
-        # Attach via relationship
-        from docx.opc.part import Part
-        from docx.opc.packuri import PackURI
-        uri = PackURI('/word/comments.xml')
-        ct  = 'application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml'
-        cp  = Part(uri, ct, xml_str.encode(), doc.part.package)
-        doc.part.relate_to(
-            cp, 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments')
-        root = etree.fromstring(xml_str.encode())
+    # Safely get or create the comments part (only creates it once per document)
+    cp = _get_or_create_comments_part(doc)
+    root = etree.fromstring(cp.blob)
 
     # Add <w:comment> element
     comment_el = etree.SubElement(root, f'{{{W_NS}}}comment')
-    comment_el.set(f'{{{W_NS}}}id',      str(cid))
-    comment_el.set(f'{{{W_NS}}}author',  author)
-    comment_el.set(f'{{{W_NS}}}date',    date_str)
-    comment_el.set(f'{{{W_NS}}}initials','TS')
+    comment_el.set(f'{{{W_NS}}}id',       str(cid))
+    comment_el.set(f'{{{W_NS}}}author',   author)
+    comment_el.set(f'{{{W_NS}}}date',     date_str)
+    comment_el.set(f'{{{W_NS}}}initials', 'TS')
+    
     p_el = etree.SubElement(comment_el, f'{{{W_NS}}}p')
     r_el = etree.SubElement(p_el,       f'{{{W_NS}}}r')
     t_el = etree.SubElement(r_el,       f'{{{W_NS}}}t')
     t_el.text = text
-    t_el.set('{http://www.w3.org/XML/1998/namespace}space','preserve')
+    t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+    
+    # Write changes back to the part's blob
     cp._blob = etree.tostring(root, xml_declaration=True, encoding='UTF-8', standalone=True)
 
-    # Add markers to paragraph XML
+    # Add markers to the original paragraph's XML
     px = para._p
-    crs = OxmlElement('w:commentRangeStart'); crs.set(qn('w:id'),str(cid)); px.insert(0,crs)
-    cre = OxmlElement('w:commentRangeEnd');   cre.set(qn('w:id'),str(cid)); px.append(cre)
+    
+    crs = OxmlElement('w:commentRangeStart')
+    crs.set(qn('w:id'), str(cid))
+    px.insert(0, crs)
+    
+    cre = OxmlElement('w:commentRangeEnd')
+    cre.set(qn('w:id'), str(cid))
+    px.append(cre)
+    
     rr  = OxmlElement('w:r')
-    rpr = OxmlElement('w:rPr'); rs = OxmlElement('w:rStyle')
-    rs.set(qn('w:val'),'CommentReference'); rpr.append(rs); rr.append(rpr)
-    cr  = OxmlElement('w:commentReference'); cr.set(qn('w:id'),str(cid)); rr.append(cr)
+    rpr = OxmlElement('w:rPr')
+    rs  = OxmlElement('w:rStyle')
+    rs.set(qn('w:val'), 'CommentReference')
+    rpr.append(rs)
+    rr.append(rpr)
+    
+    cr  = OxmlElement('w:commentReference')
+    cr.set(qn('w:id'), str(cid))
+    rr.append(cr)
     px.append(rr)
-
-
+  
 def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
     is_docx = filename.lower().endswith(".docx")
 
@@ -610,7 +634,17 @@ def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
             doc.add_paragraph("[Original text — supervisor comments attached below]")
 
     date_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
-    cid = 0
+    
+    # Scan for existing comments to prevent Word corruption from duplicate IDs
+    cp = _get_or_create_comments_part(doc)
+    root = etree.fromstring(cp.blob)
+    W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    existing_ids = [
+        int(el.get(f'{{{W_NS}}}id')) 
+        for el in root.findall(f'.//{{{W_NS}}}comment') 
+        if el.get(f'{{{W_NS}}}id') is not None
+    ]
+    cid = max(existing_ids) + 1 if existing_ids else 0
 
     # Build excerpt → comment lookup
     lookup: dict[str, list] = {}
