@@ -2,7 +2,9 @@ fastapi
 uvicorn
 python-multipart
 python-docx
+lxml
 pypdf
+PyMuPDF
 reportlab
 Pillow
 google-generativeai
