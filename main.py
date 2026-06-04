@@ -77,7 +77,7 @@ if GEMINI_AVAILABLE:
     gkey = os.environ.get("GEMINI_API_KEY")
     if gkey:
         genai.configure(api_key=gkey)
-        gemini_classifier = genai.GenerativeModel("gemini-2.5-flash-lite-preview-06-17")
+        gemini_classifier = genai.GenerativeModel("gemini-3.1-flash-lite")
         print("Gemini Flash Lite ready")
 
 if ANTHROPIC_AVAILABLE:
