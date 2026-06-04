@@ -621,7 +621,7 @@ def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
     if is_docx:
         doc = DocxDocument(io.BytesIO(content))
     else:
-        # PDF: build a fresh DOCX reproducing structure
+        # PDF: build a fresh DOCX and inject the extracted text
         doc = DocxDocument()
         doc.add_heading("ThesisSifu Pro — Annotated Commentary", 0)
         doc.add_paragraph(
@@ -629,10 +629,19 @@ def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
             "Inline comments are inserted below each flagged paragraph."
         )
         doc.add_page_break()
-        for cs in chs:
-            doc.add_heading(f"Chapter {cs.chapter_num} — {cs.chapter_title}", 1)
-            doc.add_paragraph("[Original text — supervisor comments attached below]")
-
+        
+        # Extract the raw text from the PDF and write it into the new DOCX
+        pdf_text = extract_text(content, filename)
+        
+        # Split into approximate paragraphs so the comment matcher works
+        paragraphs = pdf_text.split('\n\n') 
+        if len(paragraphs) < 5:
+            paragraphs = pdf_text.split('\n')
+            
+        for p_text in paragraphs:
+            cleaned = p_text.strip()
+            if cleaned:
+                doc.add_paragraph(cleaned)
     date_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
     
     # Scan for existing comments to prevent Word corruption from duplicate IDs
