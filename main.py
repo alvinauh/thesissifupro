@@ -30,6 +30,7 @@ from dataclasses import dataclass, field as dc_field
 from typing import Optional
 
 import pypdf
+import fitz  # PyMuPDF for sticky notes
 from docx import Document as DocxDocument
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement, parse_xml
@@ -556,7 +557,6 @@ def _get_or_create_comments_part(doc):
             return rel.target_part
             
     # 2. Create new part and bind it natively so it saves correctly
-    # 2. Create new part and bind it natively so it saves correctly
     # Note: No <?xml...?> declaration here to prevent lxml ValueError
     xml_str = '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
     element = parse_xml(xml_str)
@@ -615,37 +615,14 @@ def _insert_comment(doc, para, cid, author, text, date_str):
     cr.set(qn('w:id'), str(cid))
     rr.append(cr)
     px.append(rr)
-  
-def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
-    is_docx = filename.lower().endswith(".docx")
 
-    if is_docx:
-        doc = DocxDocument(io.BytesIO(content))
-    else:
-        # PDF: build a fresh DOCX and inject the extracted text
-        doc = DocxDocument()
-        doc.add_heading("ThesisSifu Pro — Annotated Commentary", 0)
-        doc.add_paragraph(
-            f"Source file: {filename}\n"
-            "Inline comments are inserted below each flagged paragraph."
-        )
-        doc.add_page_break()
-        
-        # Extract the raw text from the PDF and write it into the new DOCX
-        pdf_text = extract_text(content, filename)
-        
-        # Split into approximate paragraphs so the comment matcher works
-        paragraphs = pdf_text.split('\n\n') 
-        if len(paragraphs) < 5:
-            paragraphs = pdf_text.split('\n')
-            
-        for p_text in paragraphs:
-            cleaned = p_text.strip()
-            if cleaned:
-                doc.add_paragraph(cleaned)
+
+def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
+    """Unzips a DOCX, injects inline XML comments next to flagged paragraphs, and rezips."""
+    doc = DocxDocument(io.BytesIO(content))
     date_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
     
-    # Scan for existing comments properly using python-docx's xpath
+    # Scan for existing comments properly using python-docx's xpath to prevent ID collisions
     cp = _get_or_create_comments_part(doc)
     existing_ids = []
     for comment in cp.element.xpath('.//w:comment'):
@@ -666,17 +643,23 @@ def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
     for para in doc.paragraphs:
         if not para.text.strip() or len(para.text.strip()) < 30:
             continue
+        
         pkey = para.text[:50].lower().strip()
         best, best_sc = None, 0
+        
         for ekey, cmts in lookup.items():
-            aw = set(pkey.split()); bw = set(ekey.split())
+            aw = set(pkey.split())
+            bw = set(ekey.split())
             sc = len(aw & bw) / max(len(aw), 1)
             if sc > best_sc and sc > 0.35:
-                best_sc = sc; best = (ekey, cmts)
+                best_sc = sc
+                best = (ekey, cmts)
+                
         if best:
             for c in best[1]:
                 if id(c) in matched: continue
                 matched.add(id(c))
+                
                 sev = {"CRITICAL":"[CRITICAL]","MODERATE":"[MODERATE]",
                        "SUGGESTION":"[SUGGESTION]"}.get(c.severity,"[NOTE]")
                 txt = (f"{sev} ThesisSifu Pro\n\n"
@@ -691,7 +674,7 @@ def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
                     print(f"Comment insert error {cid}: {e}")
                     cid += 1
 
-    # Header
+    # Update Header with Audit details
     hdr = doc.sections[0].header
     if hdr.paragraphs:
         hdr.paragraphs[0].text = (
@@ -699,9 +682,66 @@ def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
             f"{datetime.now().strftime('%d %B %Y')}"
         )
 
-    buf = io.BytesIO(); doc.save(buf); buf.seek(0); return buf.getvalue()
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+  
+# ── Output 2: Annotated PDF (Sticky Notes) ─────────────────────
+def build_annotated_pdf(content: bytes, filename: str, audit_id: str, chs: list) -> bytes:
+    """Injects native interactive Sticky Notes into a PDF document."""
+    doc = fitz.open(stream=content, filetype="pdf")
+    
+    for cs in chs:
+        for c in cs.comments:
+            # Grab a short chunk of text to search for
+            search_text = c.para_excerpt[:35].replace('\n', ' ').strip()
+            
+            # Estimate where the text is, give a 2-page buffer just in case
+            start_page = max(0, c.page_estimate - 2)
+            end_page = min(len(doc), c.page_estimate + 2)
+            
+            annotated = False
+            sev = {"CRITICAL":"[CRITICAL]","MODERATE":"[MODERATE]","SUGGESTION":"[SUGGESTION]"}.get(c.severity,"[NOTE]")
+            txt = (f"{sev} ThesisSifu Pro\n\n"
+                   f"ISSUE: {c.issue}\n\n"
+                   f"RECOMMENDATION: {c.recommendation}\n\n"
+                   f"LITERATURE NEEDED: {c.literature_needed}\n\n"
+                   f"THEORY/FRAMEWORK: {c.theory_needed}")
 
+            for p_num in range(start_page, end_page):
+                page = doc[p_num]
+                rects = page.search_for(search_text)
+                
+                if rects:
+                    rect = rects[0]
+                    # Place the sticky note slightly to the left of the text
+                    point = fitz.Point(rect.x0 - 15, rect.y0) 
+                    annot = page.add_text_annot(point, txt)
+                    annot.set_info(title="ThesisSifu Pro", content=txt)
+                    
+                    if c.severity == "CRITICAL":
+                        annot.set_colors(stroke=(1, 0, 0))  # Red
+                    elif c.severity == "MODERATE":
+                        annot.set_colors(stroke=(1, 0.5, 0))  # Orange
+                    else:
+                        annot.set_colors(stroke=(0, 0, 1))  # Blue
+                        
+                    annot.update()
+                    annotated = True
+                    break
+            
+            # Fallback if text not found visually
+            if not annotated:
+                fallback_page = min(c.page_estimate - 1, len(doc) - 1)
+                page = doc[fallback_page]
+                point = fitz.Point(30, 30)
+                annot = page.add_text_annot(point, f"[TEXT NOT FOUND ON PAGE] \n{txt}")
+                annot.set_colors(stroke=(0.5, 0.5, 0.5))
+                annot.update()
 
+    return doc.write()
+  
 # ── Output 3: Commentary Report PDF ───────────────────────────
 def build_commentary_pdf(filename, audit_id, doc_type, clf, chs) -> bytes:
     buf=io.BytesIO()
@@ -847,16 +887,24 @@ async def audit_document(file: UploadFile = File(...)):
     examiner_text = await run_examiner(doc_type, title, field, inst, chs)
 
     # 6. Build three outputs
-    pdf1  = build_examiner_pdf(filename,  audit_id, doc_type, clf, examiner_text, chs)
-    docx2 = build_annotated_docx(content, filename, audit_id, chs, clf)
-    pdf3  = build_commentary_pdf(filename, audit_id, doc_type, clf, chs)
+    pdf1 = build_examiner_pdf(filename, audit_id, doc_type, clf, examiner_text, chs)
+    
+    # Smart Routing: PDF vs DOCX
+    if filename.lower().endswith(".pdf"):
+        output2 = build_annotated_pdf(content, filename, audit_id, chs)
+        out2_name = "2_Annotated_Thesis.pdf"
+    else:
+        output2 = build_annotated_docx(content, filename, audit_id, chs, clf)
+        out2_name = "2_Annotated_Thesis.docx"
+        
+    pdf3 = build_commentary_pdf(filename, audit_id, doc_type, clf, chs)
 
     # 7. ZIP and return
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-    with zipfile.ZipFile(tmp,"w",zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("1_Examiner_Audit_Report.pdf", pdf1)
-        zf.writestr("2_Annotated_Thesis.docx",     docx2)
-        zf.writestr("3_Commentary_Report.pdf",      pdf3)
+        zf.writestr(out2_name, output2)  # Dynamically adds the .pdf or .docx
+        zf.writestr("3_Commentary_Report.pdf", pdf3)
     tmp.close()
 
     return FileResponse(
