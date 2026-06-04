@@ -33,7 +33,7 @@ import pypdf
 from docx import Document as DocxDocument
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement, parse_xml
-from docx.parts.xmlpart import XmlPart
+from docx.opc.part import XmlPart
 from docx.opc.packuri import PackURI
 from lxml import etree
 
