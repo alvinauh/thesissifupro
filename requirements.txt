@@ -7,5 +7,5 @@ pypdf
 PyMuPDF
 reportlab
 Pillow
-google-generativeai
+google-genai>=0.8.0 
 anthropic
