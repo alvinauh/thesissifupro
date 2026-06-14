@@ -52,7 +52,7 @@ from reportlab.platypus import (
 )
 
 try:
-    import google.generativeai as genai
+    from google import genai as genai_sdk
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
@@ -71,15 +71,20 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 
 
 # ── AI Clients ─────────────────────────────────────────────────
-gemini_classifier = None
 claude_client     = None
 
 if GEMINI_AVAILABLE:
     gkey = os.environ.get("GEMINI_API_KEY")
     if gkey:
-        genai.configure(api_key=gkey)
-        gemini_classifier = genai.GenerativeModel("gemini-3.1-flash-lite")
-        print("Gemini Flash Lite ready")
+        gemini_client = genai_sdk.Client(api_key=gkey)
+        GEMINI_MODEL  = "gemini-2.0-flash-lite"
+        print(f"Gemini {GEMINI_MODEL} ready (google.genai SDK)")
+    else:
+        gemini_client = None
+        GEMINI_MODEL  = ""
+else:
+    gemini_client = None
+    GEMINI_MODEL  = ""
 
 if ANTHROPIC_AVAILABLE:
     akey = os.environ.get("ANTHROPIC_API_KEY")
@@ -447,15 +452,16 @@ Document excerpt (front + back samples):
 """
 
 async def extract_spine(text: str) -> ThesisSpine:
-    if not gemini_classifier or not text.strip():
+    if not gemini_client or not text.strip():
         return ThesisSpine()
     # Sample front (intro/method/RQs) AND back (findings/conclusion) for fuller spine
     front = text[:6000]
     back  = text[-4000:] if len(text) > 10000 else ""
     sample = front + "\n\n[...later in the document...]\n\n" + back
     try:
-        r = await gemini_classifier.generate_content_async(
-            _SPINE_PROMPT.format(text=sample[:12000]))
+        r = await gemini_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=_SPINE_PROMPT.format(text=sample[:12000]))
         raw = re.sub(r"```(?:json)?", "", r.text.strip()).strip("`").strip()
         d = json.loads(raw)
         return ThesisSpine(
@@ -495,11 +501,12 @@ Excerpt:
 async def classify_document(text: str) -> dict:
     default = {"type":"MASTERS","confidence":"LOW","signals":["fallback"],
                "title":"UNKNOWN","authors":"UNKNOWN","field":"UNKNOWN","institution":"UNKNOWN"}
-    if not gemini_classifier or not text.strip():
+    if not gemini_client or not text.strip():
         return default
     try:
-        r = await gemini_classifier.generate_content_async(
-            _CLS_PROMPT.format(text=text[:5000]))
+        r = await gemini_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=_CLS_PROMPT.format(text=text[:5000]))
         raw = re.sub(r"```(?:json)?","", r.text.strip()).strip("`").strip()
         return json.loads(raw)
     except Exception as e:
@@ -558,7 +565,7 @@ Subsection text:
 
 async def audit_subsection(sub: Subsection, ch_title: str, doc_type: str,
                             spine: ThesisSpine) -> list[ParagraphComment]:
-    if not gemini_classifier or not sub.text.strip():
+    if not gemini_client or not sub.text.strip():
         return []
     prompt = _SUBSECTION_PROMPT.format(
         doc_type=doc_type,
@@ -578,7 +585,9 @@ async def audit_subsection(sub: Subsection, ch_title: str, doc_type: str,
         text=sub.text[:7000],
     )
     try:
-        r = await gemini_classifier.generate_content_async(prompt)
+        r = await gemini_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt)
         raw = re.sub(r"```(?:json)?", "", r.text.strip()).strip("`").strip()
         items = json.loads(raw)
         if not isinstance(items, list):
@@ -1712,7 +1721,7 @@ async def audit_document(file: UploadFile = File(...)):
 async def health():
     return {
         "status":                "ok",
-        "classifier_available":  gemini_classifier is not None,
+        "classifier_available":  gemini_client is not None,
         "audit_model_available": claude_client is not None,
         "version":               "4.0.0",
         "stages":                ["spine_extraction", "chapter_subsection_split",
