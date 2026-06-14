@@ -86,7 +86,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 # ── AI Clients ─────────────────────────────────────────────────
 gemini_client = None
 claude_client = None
-GEMINI_MODEL  = "gemini-3.1-flash-lite"   # flash (not flash-lite) for better JSON reliability
+GEMINI_MODEL  = "gemini-2.5-flash"   # current stable model as of June 2026
 
 if GEMINI_AVAILABLE:
     gkey = os.environ.get("GEMINI_API_KEY")
@@ -1355,16 +1355,53 @@ def detect_verdict(text):
         if lbl in u: return lbl.title(), col
     return "Review Complete", ACCENT
 
+def _safe_para(text: str, style) -> "Paragraph":
+    """Create a ReportLab Paragraph, stripping any HTML tags that would cause
+    XML parse errors (e.g. mismatched <b>/<i> from Claude's markdown output)."""
+    import html as html_mod
+    # 1. Escape raw ampersands that aren't already entities
+    text = re.sub(r'&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[\da-fA-F]+);)', '&amp;', text)
+    # 2. Strip any XML/HTML angle-bracket tags that are malformed or unknown to ReportLab
+    #    Keep only the tags ReportLab actually supports: b, i, u, br, font, super, sub
+    allowed = {'b','i','u','br','font','super','sub','strike'}
+    def _strip_bad_tags(m):
+        tag = m.group(1).lower().split()[0].lstrip('/')
+        return m.group(0) if tag in allowed else ''
+    text = re.sub(r'<(/?\w[^>]*)>', _strip_bad_tags, text)
+    # 3. Balance remaining b/i tags — close any that were opened but not closed
+    for tag in ('b', 'i', 'u'):
+        opens  = len(re.findall(f'<{tag}>', text))
+        closes = len(re.findall(f'</{tag}>', text))
+        if opens > closes:
+            text += f'</{tag}>' * (opens - closes)
+        elif closes > opens:
+            text = f'<{tag}>' * (closes - opens) + text
+    try:
+        return Paragraph(text, style)
+    except Exception:
+        # Last resort: strip ALL tags and render as plain text
+        plain = re.sub(r'<[^>]+>', '', text)
+        return Paragraph(plain, style)
+
 def body2story(S, body):
     items = []
     for line in body.split("\n"):
         line = line.strip()
-        if not line: items.append(Spacer(1,3)); continue
-        line = re.sub(r'\*\*(.+?)\*\*',r'<b>\1</b>',line)
-        line = re.sub(r'\*(.+?)\*',r'<i>\1</i>',line)
-        if re.match(r'^[-•]\s+',line): items.append(Paragraph("• "+line[2:],S["Bullet"]))
-        elif re.match(r'^\d+[\.\)]\s+',line): items.append(Paragraph(line,S["Bullet"]))
-        else: items.append(Paragraph(line,S["Body"]))
+        if not line:
+            items.append(Spacer(1,3))
+            continue
+        # Convert markdown bold/italic to HTML — handle ***text*** (bold+italic) first
+        line = re.sub(r'\*\*\*(.+?)\*\*\*', r'<b><i>\1</i></b>', line)
+        line = re.sub(r'\*\*(.+?)\*\*',     r'<b>\1</b>',         line)
+        line = re.sub(r'\*(.+?)\*',          r'<i>\1</i>',         line)
+        # Strip markdown headers (### ## #) — ReportLab can't render them
+        line = re.sub(r'^#{1,6}\s+', '', line)
+        if re.match(r'^[-•]\s+', line):
+            items.append(_safe_para("• " + line[2:], S["Bullet"]))
+        elif re.match(r'^\d+[\.\)]\s+', line):
+            items.append(_safe_para(line, S["Bullet"]))
+        else:
+            items.append(_safe_para(line, S["Body"]))
     return items
 
 def _comment_text(c: ParagraphComment) -> str:
