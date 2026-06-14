@@ -1,21 +1,33 @@
 """
-ThesisSifu Pro v4.0 — Multi-Agent Thesis Panel (Alignment-Aware Edition)
+ThesisSifu Pro v4.1 — Multi-Agent Thesis Panel (Alignment-Aware Edition)
 ========================================================================
-Four-output audit system with structural-spine extraction, subsection-level
-analysis, dedicated alignment auditing, and a curated framework library.
+FIXES in v4.1:
+  - Migrated to google.genai SDK (google-generativeai deprecated)
+  - Robust chapter splitter: handles "CHAPTER 1", "Chapter One", "1.", Roman numerals,
+    ALL-CAPS titles, titles on next line, and plain numbered headings
+  - Robust subsection splitter: no longer filters by chapter_num (breaks on Roman numerals);
+    instead detects subsections by position within the chapter text slice
+  - Safe Gemini response handling: checks candidates/finish_reason before .text access,
+    with detailed error logging per call site
+  - Page estimation fixed: searches actual chapter text for the excerpt,
+    not just the subsection slice
+  - Prompt injection guard: CANONICAL constants passed via .replace() not .format()
+    to prevent KeyError on any curly braces in canonical text
+  - Annotated PDF: bumped search window and added full-text fallback search
+  - All exceptions logged with chapter+subsection context for Railway log debugging
 
 Pipeline:
-  Stage 0  Spine Extraction        (Gemini)  → ThesisSpine
-  Stage 1  Chapter + Subsection Split        → structural map
-  Stage 2  Subsection paragraph audit (Gemini, parallel) → uses spine + framework library
-  Stage 3  Alignment Audit         (Claude)  → AlignmentMatrix
-  Stage 4  Holistic Examiner Report (Claude) → uses spine + matrix
+  Stage 0  Spine Extraction        (Gemini)   → ThesisSpine
+  Stage 1  Chapter + Subsection Split (regex) → structural map
+  Stage 2  Subsection paragraph audit (Gemini, parallel, max 4 concurrent)
+  Stage 3  Alignment Audit         (Claude)   → AlignmentMatrix
+  Stage 4  Holistic Examiner Report (Claude)  → uses spine + matrix
 
 Outputs (ZIP):
   1_Examiner_Audit_Report.pdf     — holistic critique, references spine
   2_Annotated_Thesis.(docx|pdf)   — subsection-aware inline comments
   3_Commentary_Report.pdf         — grouped by chapter → subsection → paragraph
-  4_Alignment_Matrix_Report.pdf   — PS↔RQ↔RO↔Method↔Analysis↔Findings↔Conclusion
+  4_Alignment_Matrix_Report.pdf   — RQ↔RO↔Method↔Analysis↔Finding↔Conclusion
 
 Endpoint:  POST /audit   multipart/form-data { file: <pdf|docx> }
 Returns:   application/zip
@@ -23,7 +35,7 @@ Returns:   application/zip
 
 from __future__ import annotations
 
-import io, os, re, json, asyncio, zipfile, hashlib, tempfile
+import io, os, re, json, asyncio, zipfile, hashlib, tempfile, traceback
 from datetime import datetime
 from dataclasses import dataclass, field as dc_field
 from typing import Optional
@@ -65,32 +77,31 @@ except ImportError:
 
 
 # ── App ────────────────────────────────────────────────────────
-app = FastAPI(title="ThesisSifu Pro v4 — Alignment-Aware", version="4.0.0")
+app = FastAPI(title="ThesisSifu Pro v4.1 — Alignment-Aware", version="4.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 
 # ── AI Clients ─────────────────────────────────────────────────
-claude_client     = None
+gemini_client = None
+claude_client = None
+GEMINI_MODEL  = "gemini-2.0-flash"   # flash (not flash-lite) for better JSON reliability
 
 if GEMINI_AVAILABLE:
     gkey = os.environ.get("GEMINI_API_KEY")
     if gkey:
         gemini_client = genai_sdk.Client(api_key=gkey)
-        GEMINI_MODEL  = "gemini-2.0-flash-lite"
-        print(f"Gemini {GEMINI_MODEL} ready (google.genai SDK)")
+        print(f"[ThesisSifu] Gemini {GEMINI_MODEL} ready (google.genai SDK)")
     else:
-        gemini_client = None
-        GEMINI_MODEL  = ""
-else:
-    gemini_client = None
-    GEMINI_MODEL  = ""
+        print("[ThesisSifu] WARNING: GEMINI_API_KEY not set")
 
 if ANTHROPIC_AVAILABLE:
     akey = os.environ.get("ANTHROPIC_API_KEY")
     if akey:
         claude_client = anthropic.AsyncAnthropic(api_key=akey)
-        print("Claude Sonnet 4.6 ready")
+        print("[ThesisSifu] Claude Sonnet 4.6 ready")
+    else:
+        print("[ThesisSifu] WARNING: ANTHROPIC_API_KEY not set")
 
 
 # ── Colours ────────────────────────────────────────────────────
@@ -107,14 +118,12 @@ WHITE  = colors.white
 LGRAY  = colors.HexColor("#EEEEEE")
 
 SEV_COLORS = {"CRITICAL": RED, "MODERATE": AMBER, "SUGGESTION": ACCENT}
-
-# Alignment status colours
 ALIGN_COLORS = {
-    "ALIGNED":     GREEN,
-    "PARTIAL":     AMBER,
-    "MISALIGNED":  RED,
-    "MISSING":     colors.HexColor("#555555"),
-    "UNCLEAR":     ACCENT,
+    "ALIGNED":    GREEN,
+    "PARTIAL":    AMBER,
+    "MISALIGNED": RED,
+    "MISSING":    colors.HexColor("#555555"),
+    "UNCLEAR":    ACCENT,
 }
 
 TYPE_LABELS = {
@@ -131,126 +140,91 @@ TYPE_COLORS = {
 }
 
 
-# ── Canonical Framework & Method Library ──────────────────────
-# Curated, named-author references. The LLM is instructed to recommend
-# FROM this list rather than invent titles — prevents hallucination while
-# still giving students actionable, specific guidance.
-CANONICAL_FRAMEWORKS = """
-THEORETICAL FRAMEWORKS (recommend by exact name + seminal author):
+# ── Canonical libraries (NO curly braces — passed as plain text) ───────────
+CANONICAL_FRAMEWORKS = (
+    "THEORETICAL FRAMEWORKS (recommend by exact name + seminal author):\n"
+    "\nTechnology / Information Systems:\n"
+    "  - Technology Acceptance Model (TAM) — Davis (1989)\n"
+    "  - UTAUT / UTAUT2 — Venkatesh et al. (2003, 2012)\n"
+    "  - Diffusion of Innovations — Rogers (2003)\n"
+    "  - Task-Technology Fit — Goodhue & Thompson (1995)\n"
+    "  - DeLone & McLean IS Success Model — DeLone & McLean (2003)\n"
+    "\nBehavioural / Psychological:\n"
+    "  - Theory of Planned Behaviour — Ajzen (1991)\n"
+    "  - Theory of Reasoned Action — Fishbein & Ajzen (1975)\n"
+    "  - Social Cognitive Theory — Bandura (1986)\n"
+    "  - Self-Determination Theory — Deci & Ryan (1985, 2000)\n"
+    "  - Health Belief Model — Rosenstock (1974)\n"
+    "\nStrategic Management / Business:\n"
+    "  - Resource-Based View — Barney (1991)\n"
+    "  - Dynamic Capabilities — Teece, Pisano & Shuen (1997)\n"
+    "  - Porter's Five Forces — Porter (1980)\n"
+    "  - Stakeholder Theory — Freeman (1984)\n"
+    "  - Institutional Theory — DiMaggio & Powell (1983)\n"
+    "\nOrganisational Behaviour / HR:\n"
+    "  - Job Demands-Resources Model — Bakker & Demerouti (2007)\n"
+    "  - Social Exchange Theory — Blau (1964)\n"
+    "  - Transformational Leadership — Bass (1985)\n"
+    "  - Psychological Capital — Luthans et al. (2007)\n"
+    "\nMarketing / Consumer Behaviour:\n"
+    "  - Stimulus-Organism-Response (SOR) — Mehrabian & Russell (1974)\n"
+    "  - SERVQUAL — Parasuraman, Zeithaml & Berry (1988)\n"
+    "  - Customer-Based Brand Equity — Keller (1993)\n"
+    "  - Expectation-Confirmation Theory — Oliver (1980)\n"
+    "\nEducation / Learning:\n"
+    "  - Constructivism — Piaget, Vygotsky\n"
+    "  - Bloom's Taxonomy (revised) — Anderson & Krathwohl (2001)\n"
+    "  - Community of Inquiry — Garrison, Anderson & Archer (2000)\n"
+    "  - TPACK — Mishra & Koehler (2006)\n"
+)
 
-Technology / Information Systems:
-  - Technology Acceptance Model (TAM) — Davis (1989)
-  - UTAUT / UTAUT2 — Venkatesh et al. (2003, 2012)
-  - Diffusion of Innovations — Rogers (2003)
-  - Task-Technology Fit — Goodhue & Thompson (1995)
-  - DeLone & McLean IS Success Model — DeLone & McLean (2003)
-
-Behavioural / Psychological:
-  - Theory of Planned Behaviour — Ajzen (1991)
-  - Theory of Reasoned Action — Fishbein & Ajzen (1975)
-  - Social Cognitive Theory — Bandura (1986)
-  - Self-Determination Theory — Deci & Ryan (1985, 2000)
-  - Health Belief Model — Rosenstock (1974)
-
-Strategic Management / Business:
-  - Resource-Based View — Barney (1991)
-  - Dynamic Capabilities — Teece, Pisano & Shuen (1997)
-  - Porter's Five Forces — Porter (1980)
-  - Stakeholder Theory — Freeman (1984)
-  - Institutional Theory — DiMaggio & Powell (1983)
-
-Organisational Behaviour / HR:
-  - Job Demands-Resources Model — Bakker & Demerouti (2007)
-  - Social Exchange Theory — Blau (1964)
-  - Transformational Leadership — Bass (1985)
-  - Organisational Citizenship Behaviour — Organ (1988)
-  - Psychological Capital — Luthans et al. (2007)
-
-Marketing / Consumer Behaviour:
-  - Stimulus-Organism-Response (SOR) — Mehrabian & Russell (1974)
-  - SERVQUAL — Parasuraman, Zeithaml & Berry (1988)
-  - Customer-Based Brand Equity — Keller (1993)
-  - Expectation-Confirmation Theory — Oliver (1980)
-
-Education / Learning:
-  - Constructivism — Piaget, Vygotsky
-  - Bloom's Taxonomy (revised) — Anderson & Krathwohl (2001)
-  - Community of Inquiry — Garrison, Anderson & Archer (2000)
-  - Self-Regulated Learning — Zimmerman (2002)
-  - TPACK — Mishra & Koehler (2006)
-
-Sociology / Public Policy:
-  - Structuration Theory — Giddens (1984)
-  - Social Capital — Putnam (2000), Bourdieu (1986)
-  - Capability Approach — Sen (1999), Nussbaum (2011)
-"""
-
-CANONICAL_METHODS = """
-METHODOLOGICAL REFERENCES (recommend by exact name + seminal author):
-
-Quantitative analytical techniques:
-  - PLS-SEM — Hair, Hult, Ringle & Sarstedt (2017, 2022); for prediction & theory development
-  - CB-SEM — Byrne (2016), Kline (2015); for confirmatory theory testing
-  - Multiple Regression — Field (2018), Hair et al. (2019)
-  - Hierarchical regression / moderation — Aiken & West (1991), Hayes PROCESS (2018)
-  - Mediation — Baron & Kenny (1986), Preacher & Hayes (2008), Hayes (2018)
-  - ANOVA/MANOVA — Tabachnick & Fidell (2019)
-  - Factor Analysis (EFA/CFA) — Hair et al. (2019), Brown (2015)
-  - Logistic regression — Hosmer, Lemeshow & Sturdivant (2013)
-
-Qualitative analytical techniques:
-  - Thematic Analysis — Braun & Clarke (2006, 2019)
-  - Reflexive Thematic Analysis — Braun & Clarke (2022)
-  - Grounded Theory — Charmaz (2014), Strauss & Corbin (1998)
-  - Gioia Methodology — Gioia, Corley & Hamilton (2013)
-  - Interpretative Phenomenological Analysis (IPA) — Smith, Flowers & Larkin (2009)
-  - Case Study — Yin (2018), Eisenhardt (1989)
-  - Narrative Inquiry — Clandinin & Connelly (2000)
-  - Discourse Analysis — Fairclough (2013)
-
-Mixed methods:
-  - Mixed Methods Typology — Creswell & Plano Clark (2018)
-  - Sequential Explanatory / Exploratory — Creswell (2014)
-
-Systematic / scoping review:
-  - PRISMA 2020 — Page et al. (2021)
-  - Scoping review — Arksey & O'Malley (2005), Tricco et al. (2018)
-  - Bibliometric analysis — Donthu et al. (2021)
-
-Sampling / sample size:
-  - Cochran's formula — Cochran (1977)
-  - Krejcie & Morgan table — Krejcie & Morgan (1970)
-  - Yamane's formula — Yamane (1967)
-  - G*Power power analysis — Faul, Erdfelder, Lang & Buchner (2009)
-  - Minimum sample for PLS-SEM (10-times rule, inverse square root) — Hair et al. (2017)
-
-Validity & reliability:
-  - Cronbach's alpha — Cronbach (1951)
-  - Composite reliability, AVE — Hair et al. (2017), Fornell & Larcker (1981)
-  - HTMT discriminant validity — Henseler, Ringle & Sarstedt (2015)
-  - Common Method Bias — Podsakoff et al. (2003, 2012); Harman's single-factor test
-  - Content validity index (CVI) — Lynn (1986), Polit & Beck (2006)
-
-Qualitative trustworthiness:
-  - Lincoln & Guba (1985) — credibility, transferability, dependability, confirmability
-  - Member checking, audit trail, thick description
-"""
+CANONICAL_METHODS = (
+    "METHODOLOGICAL REFERENCES (recommend by exact name + seminal author):\n"
+    "\nQuantitative analytical techniques:\n"
+    "  - PLS-SEM — Hair, Hult, Ringle & Sarstedt (2017, 2022)\n"
+    "  - CB-SEM — Byrne (2016), Kline (2015)\n"
+    "  - Hierarchical regression / moderation — Aiken & West (1991), Hayes PROCESS (2018)\n"
+    "  - Mediation — Baron & Kenny (1986), Preacher & Hayes (2008)\n"
+    "  - ANOVA/MANOVA — Tabachnick & Fidell (2019)\n"
+    "  - Factor Analysis (EFA/CFA) — Hair et al. (2019), Brown (2015)\n"
+    "\nQualitative analytical techniques:\n"
+    "  - Thematic Analysis — Braun & Clarke (2006, 2019)\n"
+    "  - Reflexive Thematic Analysis — Braun & Clarke (2022)\n"
+    "  - Grounded Theory — Charmaz (2014), Strauss & Corbin (1998)\n"
+    "  - Gioia Methodology — Gioia, Corley & Hamilton (2013)\n"
+    "  - IPA — Smith, Flowers & Larkin (2009)\n"
+    "  - Case Study — Yin (2018), Eisenhardt (1989)\n"
+    "\nSystematic review:\n"
+    "  - PRISMA 2020 — Page et al. (2021)\n"
+    "  - Scoping review — Arksey & O'Malley (2005)\n"
+    "\nSampling / sample size:\n"
+    "  - Cochran's formula — Cochran (1977)\n"
+    "  - Krejcie & Morgan table — Krejcie & Morgan (1970)\n"
+    "  - G*Power power analysis — Faul et al. (2009)\n"
+    "  - Minimum sample for PLS-SEM — Hair et al. (2017)\n"
+    "\nValidity & reliability:\n"
+    "  - Cronbach's alpha — Cronbach (1951)\n"
+    "  - Composite reliability, AVE — Hair et al. (2017), Fornell & Larcker (1981)\n"
+    "  - HTMT — Henseler, Ringle & Sarstedt (2015)\n"
+    "  - Common Method Bias — Podsakoff et al. (2003, 2012)\n"
+    "  - Content validity index (CVI) — Lynn (1986)\n"
+    "\nQualitative trustworthiness:\n"
+    "  - Lincoln & Guba (1985) — credibility, transferability, dependability, confirmability\n"
+)
 
 
 # ── Data classes ───────────────────────────────────────────────
 @dataclass
 class ThesisSpine:
-    """The structural backbone of the thesis — extracted in Stage 0
-    and used as the reference object for every downstream audit."""
     title:              str = "UNKNOWN"
     problem_statement:  str = "NOT FOUND"
     research_gap:       str = "NOT FOUND"
-    research_questions: list = dc_field(default_factory=list)  # list[str]
+    research_questions: list = dc_field(default_factory=list)
     research_objectives:list = dc_field(default_factory=list)
     hypotheses:         list = dc_field(default_factory=list)
     theory_used:        str = "NOT FOUND"
-    variables:          list = dc_field(default_factory=list)  # constructs/IV/DV/MV
-    methodology:        str = "NOT FOUND"  # design + paradigm
+    variables:          list = dc_field(default_factory=list)
+    methodology:        str = "NOT FOUND"
     sampling:           str = "NOT FOUND"
     instrument:         str = "NOT FOUND"
     analysis_technique: str = "NOT FOUND"
@@ -260,57 +234,78 @@ class ThesisSpine:
 
 @dataclass
 class ParagraphComment:
-    chapter:           str
-    subsection:        str          # e.g. "3.2" or "—" if no subsection detected
-    subsection_title:  str
-    para_index:        int
-    page_estimate:     int
-    para_excerpt:      str
-    severity:          str
-    issue:             str
-    recommendation:    str
-    literature_needed: str
-    theory_needed:     str
-    suggested_framework: str = ""   # NEW: specific named framework from library
-    suggested_method:   str = ""    # NEW: specific named method/reference
+    chapter:             str
+    subsection:          str
+    subsection_title:    str
+    para_index:          int
+    page_estimate:       int
+    para_excerpt:        str
+    severity:            str
+    issue:               str
+    recommendation:      str
+    literature_needed:   str
+    theory_needed:       str
+    suggested_framework: str = ""
+    suggested_method:    str = ""
 
 @dataclass
 class Subsection:
-    chapter_num:    str
-    subsection_num: str
-    title:          str
-    text:           str
-    expected_purpose: str = ""      # what this kind of subsection SHOULD contain
-    comments:       list = dc_field(default_factory=list)
+    chapter_num:      str
+    subsection_num:   str
+    title:            str
+    text:             str
+    char_offset:      int = 0          # offset within full_text for page estimation
+    expected_purpose: str = ""
+    comments:         list = dc_field(default_factory=list)
 
 @dataclass
 class ChapterSummary:
     chapter_num:   str
     chapter_title: str
     text:          str = ""
-    subsections:   list = dc_field(default_factory=list)  # list[Subsection]
-    comments:      list = dc_field(default_factory=list)  # flat list across subsections
+    char_offset:   int = 0             # offset within full_text for page estimation
+    subsections:   list = dc_field(default_factory=list)
+    comments:      list = dc_field(default_factory=list)
 
 @dataclass
 class AlignmentRow:
-    """One row in the alignment matrix — e.g. RQ1 → RO1 → Method → Finding → Conclusion."""
-    rq:           str = "—"
-    ro:           str = "—"
-    hypothesis:   str = "—"
-    method:       str = "—"
-    analysis:     str = "—"
-    finding:      str = "—"
-    conclusion:   str = "—"
-    status:       str = "UNCLEAR"   # ALIGNED|PARTIAL|MISALIGNED|MISSING|UNCLEAR
-    note:         str = ""
+    rq:         str = "—"
+    ro:         str = "—"
+    hypothesis: str = "—"
+    method:     str = "—"
+    analysis:   str = "—"
+    finding:    str = "—"
+    conclusion: str = "—"
+    status:     str = "UNCLEAR"
+    note:       str = ""
 
 @dataclass
 class AlignmentMatrix:
-    rows:               list = dc_field(default_factory=list)  # list[AlignmentRow]
-    overall_verdict:    str = ""
-    golden_thread_score: str = ""   # STRONG|ACCEPTABLE|WEAK|BROKEN
-    critical_gaps:      list = dc_field(default_factory=list)  # list[str]
+    rows:                       list = dc_field(default_factory=list)
+    overall_verdict:            str = ""
+    golden_thread_score:        str = "UNCLEAR"
+    critical_gaps:              list = dc_field(default_factory=list)
     structural_recommendations: list = dc_field(default_factory=list)
+
+
+# ── Gemini response helper ─────────────────────────────────────
+def _gemini_text(response, context: str = "") -> str:
+    """Safely extract text from a google.genai response.
+    Logs the finish reason if the response was blocked or empty."""
+    try:
+        if not response or not response.candidates:
+            print(f"[ThesisSifu] Gemini: no candidates returned. Context: {context}")
+            return ""
+        cand = response.candidates[0]
+        # finish_reason: 1=STOP 2=MAX_TOKENS 3=SAFETY 4=RECITATION 5=OTHER
+        reason = getattr(cand, "finish_reason", None)
+        if reason and reason not in (1, "STOP"):
+            print(f"[ThesisSifu] Gemini blocked/incomplete. reason={reason} context={context}")
+            return ""
+        return response.text or ""
+    except Exception as e:
+        print(f"[ThesisSifu] _gemini_text error ({context}): {e}")
+        return ""
 
 
 # ── Text extraction ─────────────────────────────────────────────
@@ -318,25 +313,43 @@ def extract_text(content: bytes, filename: str) -> str:
     fn = filename.lower()
     if fn.endswith(".pdf"):
         reader = pypdf.PdfReader(io.BytesIO(content))
-        return "\n".join(p.extract_text() or "" for p in reader.pages)
+        pages = []
+        for page in reader.pages:
+            t = page.extract_text() or ""
+            pages.append(t)
+        return "\n".join(pages)
     if fn.endswith(".docx"):
         doc = DocxDocument(io.BytesIO(content))
         return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
     return ""
 
 
-# ── Chapter + Subsection splitter ─────────────────────────────
+# ── Chapter + Subsection splitter (robust) ────────────────────
+# Matches:
+#   "CHAPTER 1", "Chapter 1", "CHAPTER I", "CHAPTER ONE"
+#   "1.0 Title", "1. Title"  (numbered section heading)
+#   Allows title inline OR on the next line
+_WORD_NUMS = {"one":"1","two":"2","three":"3","four":"4","five":"5",
+              "six":"6","seven":"7","eight":"8","nine":"9","ten":"10"}
+_ROMAN = {"I":"1","II":"2","III":"3","IV":"4","V":"5",
+          "VI":"6","VII":"7","VIII":"8","IX":"9","X":"10"}
+
 _CH_PAT = re.compile(
-    r'(?:^|\n)(?:CHAPTER\s+(\d+|[IVX]+)|(\d+)\.0)\b[:\s\-—–]*([^\n]{0,80})',
+    r'(?:^|\n)'
+    r'(?:'
+      r'(?:CHAPTER|BAHAGIAN|BAB)\s+(\d+|[IVX]+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN)'
+      r'|(\d+)(?:\.0+)?\s*[:\.\-—–]'   # "1.", "1.0", "1.0:"
+    r')'
+    r'[:\s\-—–]*([^\n]{0,100})',          # optional inline title
     re.IGNORECASE,
 )
 
-# Subsection: matches 1.1, 1.2.3, 3.4 etc. at start of line.
+# Subsection: "1.1", "1.2.3", "2.4" at line start
 _SUB_PAT = re.compile(
-    r'(?:^|\n)[ \t]*(\d+\.\d+(?:\.\d+)?)\b[:\s\-—–]*([^\n]{0,120})',
+    r'(?:^|\n)[ \t]*(\d+\.\d+(?:\.\d+)?)'  # "1.1" or "1.2.3"
+    r'(?:[:\s\-—–]+([^\n]{0,120}))?',        # optional title
 )
 
-# Expected purpose of common subsection patterns. Keys are heuristic title fragments.
 _SUBSECTION_PURPOSE = {
     "background":           "Establish context and historical/practical relevance of the problem.",
     "problem statement":    "Articulate the specific research problem with empirical/theoretical evidence.",
@@ -355,7 +368,7 @@ _SUBSECTION_PURPOSE = {
     "sampling":             "Justify sampling technique and sample size with a recognised formula.",
     "instrument":           "Describe instrument development, items, scale, and pretest.",
     "validity":             "Report content/construct validity evidence (e.g., CVI, AVE).",
-    "reliability":          "Report reliability evidence (Cronbach's α, composite reliability).",
+    "reliability":          "Report reliability evidence (Cronbach's alpha, composite reliability).",
     "data collection":      "Detail procedure, ethics approval, response rate.",
     "data analysis":        "Justify analytical technique against research questions.",
     "demographic":          "Present sample profile relevant to research questions.",
@@ -378,58 +391,94 @@ def _purpose_for(title: str) -> str:
             return v
     return "Auditor should infer purpose from chapter context."
 
+def _normalise_chnum(raw: str) -> str:
+    """Convert Roman/word chapter numbers to Arabic integers."""
+    r = raw.strip().upper()
+    if r in _ROMAN: return _ROMAN[r]
+    if r.lower() in _WORD_NUMS: return _WORD_NUMS[r.lower()]
+    return raw.strip()
+
 def split_chapters(text: str) -> list[ChapterSummary]:
     matches = list(_CH_PAT.finditer(text))
     if not matches:
-        # No chapter markers — fall back to fixed-size chunks
         size = 6000
         return [ChapterSummary(chapter_num=str(i+1),
                                chapter_title=f"Section {i+1}",
-                               text=text[s:s+size])
+                               text=text[s:s+size],
+                               char_offset=s)
                 for i, s in enumerate(range(0, len(text), size))]
     chapters = []
     for i, m in enumerate(matches):
-        num   = (m.group(1) or m.group(2) or str(i+1)).strip()
-        title = (m.group(3) or "").strip() or f"Chapter {num}"
-        start = m.start()
-        end   = matches[i+1].start() if i+1 < len(matches) else len(text)
+        raw_num = (m.group(1) or m.group(2) or str(i+1))
+        num     = _normalise_chnum(raw_num)
+        title   = (m.group(3) or "").strip() or f"Chapter {num}"
+        # If title is empty the heading might continue on the next line
+        if not title.strip():
+            next_nl = text.find("\n", m.end())
+            if next_nl != -1:
+                title = text[m.end():next_nl].strip() or f"Chapter {num}"
+        start   = m.start()
+        end     = matches[i+1].start() if i+1 < len(matches) else len(text)
         ch_text = text[start:end].strip()
-        chapters.append(ChapterSummary(chapter_num=num, chapter_title=title, text=ch_text))
-    return chapters or [ChapterSummary("1", "Full Document", text)]
+        chapters.append(ChapterSummary(
+            chapter_num=num, chapter_title=title,
+            text=ch_text, char_offset=start))
+    return chapters or [ChapterSummary("1", "Full Document", text, 0)]
+
 
 def split_subsections(chapter: ChapterSummary) -> list[Subsection]:
-    """Find 1.1, 1.2... within a chapter. If none, treat the whole chapter as one."""
+    """Split a chapter into subsections.
+    FIX: No longer filters by chapter_num prefix (breaks on Roman numeral chapters).
+    Instead finds ANY 'N.M' pattern within the chapter text slice — the slice
+    already belongs to this chapter so false positives from other chapters
+    cannot appear."""
     matches = list(_SUB_PAT.finditer(chapter.text))
-    # Filter spurious matches that don't start with the chapter number
-    matches = [m for m in matches if m.group(1).split(".")[0] == chapter.chapter_num]
     if not matches:
-        return [Subsection(chapter_num=chapter.chapter_num, subsection_num="—",
-                           title=chapter.chapter_title, text=chapter.text,
-                           expected_purpose=_purpose_for(chapter.chapter_title))]
+        return [Subsection(
+            chapter_num=chapter.chapter_num, subsection_num="—",
+            title=chapter.chapter_title, text=chapter.text,
+            char_offset=chapter.char_offset,
+            expected_purpose=_purpose_for(chapter.chapter_title))]
     subs = []
     for i, m in enumerate(matches):
-        sub_num = m.group(1).strip()
+        sub_num   = m.group(1).strip()
         sub_title = (m.group(2) or "").strip() or f"Section {sub_num}"
-        start = m.start()
-        end   = matches[i+1].start() if i+1 < len(matches) else len(chapter.text)
-        sub_text = chapter.text[start:end].strip()
+        start     = m.start()
+        end       = matches[i+1].start() if i+1 < len(matches) else len(chapter.text)
+        sub_text  = chapter.text[start:end].strip()
         subs.append(Subsection(
-            chapter_num=chapter.chapter_num,
-            subsection_num=sub_num,
-            title=sub_title,
-            text=sub_text,
+            chapter_num=chapter.chapter_num, subsection_num=sub_num,
+            title=sub_title, text=sub_text,
+            char_offset=chapter.char_offset + start,
             expected_purpose=_purpose_for(sub_title),
         ))
     return subs
 
 
-# ── Stage 0: Spine Extraction (Gemini) ────────────────────────
-_SPINE_PROMPT = """
+# ── Page estimator (uses full_text offset, not sub slice) ─────
+def _estimate_page(full_text: str, excerpt: str, char_offset: int,
+                   words_per_page: int = 350) -> int:
+    """Find excerpt in full_text starting from char_offset; fall back to offset-based."""
+    search_start = max(0, char_offset - 200)
+    pos = full_text.find(excerpt[:50].strip(), search_start)
+    if pos < 0:
+        # Try shorter excerpt
+        pos = full_text.find(excerpt[:25].strip(), search_start)
+    if pos > 0:
+        word_count = len(full_text[:pos].split())
+        return max(1, word_count // words_per_page + 1)
+    # Fall back to offset
+    word_count = len(full_text[:char_offset].split())
+    return max(1, word_count // words_per_page + 1)
+
+
+# ── Stage 0: Spine Extraction ──────────────────────────────────
+_SPINE_PROMPT = """\
 You are extracting the STRUCTURAL SPINE of an academic thesis or article.
-Return STRICT JSON only — no markdown, no commentary.
+Return STRICT JSON only — no markdown, no commentary, no preamble.
 
 Fields (use "NOT FOUND" or [] if absent from the excerpt):
-{{
+{
   "title": "exact title",
   "discipline": "best guess discipline (e.g., Information Systems, Marketing, Education)",
   "problem_statement": "1-3 sentence summary of the problem",
@@ -445,57 +494,64 @@ Fields (use "NOT FOUND" or [] if absent from the excerpt):
   "analysis_technique": "PLS-SEM / thematic / regression / etc.",
   "key_findings": ["finding 1", "finding 2"],
   "conclusions": ["conclusion 1", "conclusion 2"]
-}}
+}
 
 Document excerpt (front + back samples):
-\"\"\"{text}\"\"\"
+\"\"\"EXCERPT_PLACEHOLDER\"\"\"\
 """
 
-async def extract_spine(text: str) -> ThesisSpine:
+async def extract_spine(text: str, full_text: str) -> ThesisSpine:
     if not gemini_client or not text.strip():
+        print("[ThesisSifu] Spine extraction skipped: no client or empty text")
         return ThesisSpine()
-    # Sample front (intro/method/RQs) AND back (findings/conclusion) for fuller spine
-    front = text[:6000]
-    back  = text[-4000:] if len(text) > 10000 else ""
-    sample = front + "\n\n[...later in the document...]\n\n" + back
+    front  = text[:6000]
+    back   = text[-4000:] if len(text) > 10000 else ""
+    sample = (front + "\n\n[...later in the document...]\n\n" + back)[:12000]
+    # Use .replace() instead of .format() to avoid KeyError on curly braces in text
+    prompt = _SPINE_PROMPT.replace("EXCERPT_PLACEHOLDER", sample)
     try:
         r = await gemini_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=_SPINE_PROMPT.format(text=sample[:12000]))
-        raw = re.sub(r"```(?:json)?", "", r.text.strip()).strip("`").strip()
+            model=GEMINI_MODEL, contents=prompt)
+        raw = _gemini_text(r, "spine_extraction")
+        if not raw:
+            return ThesisSpine()
+        raw = re.sub(r"```(?:json)?", "", raw).strip("`").strip()
         d = json.loads(raw)
         return ThesisSpine(
-            title=d.get("title","UNKNOWN"),
-            discipline=d.get("discipline","UNKNOWN"),
-            problem_statement=d.get("problem_statement","NOT FOUND"),
-            research_gap=d.get("research_gap","NOT FOUND"),
-            research_questions=d.get("research_questions",[]) or [],
+            title=              d.get("title","UNKNOWN"),
+            discipline=         d.get("discipline","UNKNOWN"),
+            problem_statement=  d.get("problem_statement","NOT FOUND"),
+            research_gap=       d.get("research_gap","NOT FOUND"),
+            research_questions= d.get("research_questions",[]) or [],
             research_objectives=d.get("research_objectives",[]) or [],
-            hypotheses=d.get("hypotheses",[]) or [],
-            theory_used=d.get("theory_used","NOT FOUND"),
-            variables=d.get("variables",[]) or [],
-            methodology=d.get("methodology","NOT FOUND"),
-            sampling=d.get("sampling","NOT FOUND"),
-            instrument=d.get("instrument","NOT FOUND"),
-            analysis_technique=d.get("analysis_technique","NOT FOUND"),
-            key_findings=d.get("key_findings",[]) or [],
-            conclusions=d.get("conclusions",[]) or [],
+            hypotheses=         d.get("hypotheses",[]) or [],
+            theory_used=        d.get("theory_used","NOT FOUND"),
+            variables=          d.get("variables",[]) or [],
+            methodology=        d.get("methodology","NOT FOUND"),
+            sampling=           d.get("sampling","NOT FOUND"),
+            instrument=         d.get("instrument","NOT FOUND"),
+            analysis_technique= d.get("analysis_technique","NOT FOUND"),
+            key_findings=       d.get("key_findings",[]) or [],
+            conclusions=        d.get("conclusions",[]) or [],
         )
+    except json.JSONDecodeError as e:
+        print(f"[ThesisSifu] Spine JSON parse error: {e}")
+        return ThesisSpine()
     except Exception as e:
-        print(f"Spine extraction error: {e}")
+        print(f"[ThesisSifu] Spine extraction error: {e}\n{traceback.format_exc()}")
         return ThesisSpine()
 
 
-# ── Stage 1: Classification (unchanged interface; spine carries title) ─
-_CLS_PROMPT = """
+# ── Stage 1: Classification ─────────────────────────────────────
+_CLS_PROMPT = """\
 Classify this academic document. Choose ONE:
 JOURNAL_ARTICLE | UNDERGRADUATE | MASTERS | PHD
 
 Return ONLY valid JSON (no markdown):
-{{"type":"PHD","confidence":"HIGH","signals":["s1","s2"],"title":"t","authors":"a","field":"f","institution":"i"}}
+{"type":"PHD","confidence":"HIGH","signals":["s1","s2"],"title":"t","authors":"a","field":"f","institution":"i"}
 
 Excerpt:
-\"\"\"{text}\"\"\"
+\"\"\"EXCERPT_PLACEHOLDER\"\"\"\
 """
 
 async def classify_document(text: str) -> dict:
@@ -503,185 +559,199 @@ async def classify_document(text: str) -> dict:
                "title":"UNKNOWN","authors":"UNKNOWN","field":"UNKNOWN","institution":"UNKNOWN"}
     if not gemini_client or not text.strip():
         return default
+    prompt = _CLS_PROMPT.replace("EXCERPT_PLACEHOLDER", text[:5000])
     try:
         r = await gemini_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=_CLS_PROMPT.format(text=text[:5000]))
-        raw = re.sub(r"```(?:json)?","", r.text.strip()).strip("`").strip()
+            model=GEMINI_MODEL, contents=prompt)
+        raw = _gemini_text(r, "classify_document")
+        if not raw:
+            return default
+        raw = re.sub(r"```(?:json)?","", raw).strip("`").strip()
         return json.loads(raw)
     except Exception as e:
-        print(f"Classification error: {e}")
+        print(f"[ThesisSifu] Classification error: {e}")
         return default
 
 
-# ── Stage 2: Subsection paragraph audit (spine-aware) ─────────
-_SUBSECTION_PROMPT = """
-You are a PhD supervisor auditing one SUBSECTION of a {doc_type}.
+# ── Stage 2: Subsection paragraph audit ───────────────────────
+# NOTE: Uses .replace() for CANONICAL blocks, .format() only for
+#       the simple non-curly-brace fields.
+_SUBSECTION_PROMPT_TEMPLATE = """\
+You are a PhD supervisor auditing one SUBSECTION of a DOC_TYPE_PLACEHOLDER.
 
-THESIS SPINE (for alignment checking — refer to this in every comment):
-  Title:            {title}
-  Problem:          {problem}
-  Research Qs:      {rqs}
-  Research Objs:    {ros}
-  Theory used:      {theory}
-  Methodology:      {method}
-  Analysis:         {analysis}
-  Variables:        {vars}
+THESIS SPINE (for alignment checking — cite these in every comment):
+  Title:            TITLE_PLACEHOLDER
+  Problem:          PROBLEM_PLACEHOLDER
+  Research Qs:      RQS_PLACEHOLDER
+  Research Objs:    ROS_PLACEHOLDER
+  Theory used:      THEORY_PLACEHOLDER
+  Methodology:      METHOD_PLACEHOLDER
+  Analysis:         ANALYSIS_PLACEHOLDER
+  Variables:        VARS_PLACEHOLDER
 
-CHAPTER {ch_num} — {ch_title}
-SUBSECTION {sub_num} — {sub_title}
-Expected purpose of this subsection: {purpose}
+CHAPTER CHNUM_PLACEHOLDER — CHTITLE_PLACEHOLDER
+SUBSECTION SUBNUM_PLACEHOLDER — SUBTITLE_PLACEHOLDER
+Expected purpose of this subsection: PURPOSE_PLACEHOLDER
 
 YOUR TASK
-For 4-8 paragraphs in this subsection, return JSON objects with:
-{{
-  "para_excerpt": "first 100 chars verbatim",
-  "severity": "CRITICAL | MODERATE | SUGGESTION",
-  "issue": "specific problem — be concrete and intellectual, not stylistic",
-  "recommendation": "specific fix tied to thesis spine and subsection purpose",
-  "literature_needed": "type of evidence/studies needed (do NOT invent titles)",
-  "theory_needed": "named framework from canonical library below OR 'none'",
-  "suggested_framework": "EXACT name + seminal author from canonical list, e.g., 'TAM (Davis 1989)' — empty string if none applies",
-  "suggested_method": "EXACT name + seminal author for any methodological recommendation, e.g., 'PLS-SEM (Hair et al. 2017)' — empty string if none applies"
-}}
+For 4-8 paragraphs needing attention in this subsection, return a JSON array.
+Each element must have these EXACT keys:
+[
+  {
+    "para_excerpt": "first 80 chars of the paragraph verbatim",
+    "severity": "CRITICAL",
+    "issue": "specific intellectual problem",
+    "recommendation": "specific fix tied to thesis spine",
+    "literature_needed": "type of evidence needed (do NOT invent paper titles)",
+    "theory_needed": "named framework OR none",
+    "suggested_framework": "EXACT name + author from canonical list, e.g. TAM (Davis 1989), or empty string",
+    "suggested_method": "EXACT name + author from canonical list, e.g. PLS-SEM (Hair et al. 2017), or empty string"
+  }
+]
 
-ALIGNMENT FOCUS — flag the following as CRITICAL when present:
-  • Paragraph contradicts the problem statement or strays from the RQs/ROs
-  • Claim made without subsection delivering on its expected purpose
-  • Methodology choice that cannot answer the stated RQ
-  • Finding that does not map to any RQ
-  • Conclusion that overreaches what the analysis supports
-  • Theory invoked but not operationalised in the model/instrument
+ALIGNMENT — flag CRITICAL when:
+  - Paragraph contradicts the problem statement or strays from RQs/ROs
+  - Subsection does not deliver its expected purpose
+  - Methodology cannot answer the stated RQ
+  - Finding does not map to any RQ
+  - Conclusion overreaches what the analysis supports
+  - Theory invoked but not operationalised
 
-{frameworks}
+CANONICAL FRAMEWORKS:
+FRAMEWORKS_PLACEHOLDER
 
-{methods}
+CANONICAL METHODS:
+METHODS_PLACEHOLDER
 
-Return ONLY a JSON array. No markdown fences. No prose before or after.
+Return ONLY the JSON array. No markdown fences. No prose before or after.
 
 Subsection text:
-\"\"\"{text}\"\"\"
+\"\"\"TEXT_PLACEHOLDER\"\"\"\
 """
 
 async def audit_subsection(sub: Subsection, ch_title: str, doc_type: str,
-                            spine: ThesisSpine) -> list[ParagraphComment]:
+                            spine: ThesisSpine, full_text: str) -> list[ParagraphComment]:
     if not gemini_client or not sub.text.strip():
         return []
-    prompt = _SUBSECTION_PROMPT.format(
-        doc_type=doc_type,
-        title=spine.title,
-        problem=spine.problem_statement[:300],
-        rqs="; ".join(spine.research_questions[:5]) or "NOT FOUND",
-        ros="; ".join(spine.research_objectives[:5]) or "NOT FOUND",
-        theory=spine.theory_used,
-        method=spine.methodology,
-        analysis=spine.analysis_technique,
-        vars="; ".join(spine.variables[:8]) or "NOT FOUND",
-        ch_num=sub.chapter_num, ch_title=ch_title,
-        sub_num=sub.subsection_num, sub_title=sub.title,
-        purpose=sub.expected_purpose,
-        frameworks=CANONICAL_FRAMEWORKS,
-        methods=CANONICAL_METHODS,
-        text=sub.text[:7000],
+    # Build prompt using .replace() to avoid KeyError on braces in canonical text or user text
+    prompt = (
+        _SUBSECTION_PROMPT_TEMPLATE
+        .replace("DOC_TYPE_PLACEHOLDER", doc_type)
+        .replace("TITLE_PLACEHOLDER",    spine.title[:200])
+        .replace("PROBLEM_PLACEHOLDER",  spine.problem_statement[:300])
+        .replace("RQS_PLACEHOLDER",      "; ".join(spine.research_questions[:5]) or "NOT FOUND")
+        .replace("ROS_PLACEHOLDER",      "; ".join(spine.research_objectives[:5]) or "NOT FOUND")
+        .replace("THEORY_PLACEHOLDER",   spine.theory_used)
+        .replace("METHOD_PLACEHOLDER",   spine.methodology)
+        .replace("ANALYSIS_PLACEHOLDER", spine.analysis_technique)
+        .replace("VARS_PLACEHOLDER",     "; ".join(spine.variables[:8]) or "NOT FOUND")
+        .replace("CHNUM_PLACEHOLDER",    sub.chapter_num)
+        .replace("CHTITLE_PLACEHOLDER",  ch_title[:80])
+        .replace("SUBNUM_PLACEHOLDER",   sub.subsection_num)
+        .replace("SUBTITLE_PLACEHOLDER", sub.title[:80])
+        .replace("PURPOSE_PLACEHOLDER",  sub.expected_purpose[:200])
+        .replace("FRAMEWORKS_PLACEHOLDER", CANONICAL_FRAMEWORKS)
+        .replace("METHODS_PLACEHOLDER",    CANONICAL_METHODS)
+        .replace("TEXT_PLACEHOLDER",       sub.text[:7000])
     )
+    ctx = f"ch{sub.chapter_num}.{sub.subsection_num}"
     try:
         r = await gemini_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt)
-        raw = re.sub(r"```(?:json)?", "", r.text.strip()).strip("`").strip()
+            model=GEMINI_MODEL, contents=prompt)
+        raw = _gemini_text(r, f"audit_subsection_{ctx}")
+        if not raw:
+            print(f"[ThesisSifu] Empty response for subsection {ctx}")
+            return []
+        raw = re.sub(r"```(?:json)?", "", raw).strip("`").strip()
+        # Gemini sometimes returns a single object instead of array — wrap it
+        if raw.startswith("{"):
+            raw = "[" + raw + "]"
         items = json.loads(raw)
         if not isinstance(items, list):
             items = [items]
         comments = []
         for idx, it in enumerate(items):
-            excerpt = it.get("para_excerpt","")
-            pos = sub.text.find(excerpt[:40])
-            pg  = max(1, len(sub.text[:pos].split()) // 350 + 1) if pos > 0 else 1
+            excerpt = str(it.get("para_excerpt",""))[:150]
+            pg = _estimate_page(full_text, excerpt, sub.char_offset)
             comments.append(ParagraphComment(
-                chapter=f"Chapter {sub.chapter_num}",
-                subsection=sub.subsection_num,
-                subsection_title=sub.title,
-                para_index=idx, page_estimate=pg,
-                para_excerpt=excerpt[:150],
-                severity=it.get("severity","MODERATE").upper(),
-                issue=it.get("issue",""),
-                recommendation=it.get("recommendation",""),
-                literature_needed=it.get("literature_needed",""),
-                theory_needed=it.get("theory_needed","none"),
-                suggested_framework=it.get("suggested_framework",""),
-                suggested_method=it.get("suggested_method",""),
+                chapter=            f"Chapter {sub.chapter_num}",
+                subsection=         sub.subsection_num,
+                subsection_title=   sub.title,
+                para_index=         idx,
+                page_estimate=      pg,
+                para_excerpt=       excerpt,
+                severity=           str(it.get("severity","MODERATE")).upper(),
+                issue=              str(it.get("issue","")),
+                recommendation=     str(it.get("recommendation","")),
+                literature_needed=  str(it.get("literature_needed","")),
+                theory_needed=      str(it.get("theory_needed","none")),
+                suggested_framework=str(it.get("suggested_framework","")),
+                suggested_method=   str(it.get("suggested_method","")),
             ))
+        print(f"[ThesisSifu] {ctx}: {len(comments)} comments")
         return comments
+    except json.JSONDecodeError as e:
+        print(f"[ThesisSifu] JSON parse error in {ctx}: {e}\nRaw: {raw[:300]}")
+        return []
     except Exception as e:
-        print(f"Subsection audit error {sub.chapter_num}.{sub.subsection_num}: {e}")
+        print(f"[ThesisSifu] Subsection audit error {ctx}: {e}\n{traceback.format_exc()}")
         return []
 
 
 # ── Stage 3: Alignment Audit (Claude) ─────────────────────────
-_ALIGNMENT_SYSTEM = """
-You are a senior academic examiner auditing the STRUCTURAL ALIGNMENT of a thesis.
-Your task is to verify the 'golden thread': Problem → RQ → RO → Theory → Method →
-Analysis → Findings → Discussion → Conclusion.
-
-Be rigorous and specific. Quote the spine fields. Flag broken links explicitly.
-Return STRICT JSON only. No markdown.
+_ALIGNMENT_SYSTEM = """\
+You are a senior academic examiner auditing STRUCTURAL ALIGNMENT of a thesis.
+Verify the golden thread: Problem -> RQ -> RO -> Theory -> Method -> Analysis -> Findings -> Conclusion.
+Return STRICT JSON only. No markdown, no prose outside the JSON.\
 """
 
-_ALIGNMENT_PROMPT = """
+_ALIGNMENT_PROMPT_TEMPLATE = """\
 THESIS SPINE
 ============
-Title:                {title}
-Discipline:           {discipline}
-Problem statement:    {problem}
-Research gap:         {gap}
-Research questions:   {rqs}
-Research objectives:  {ros}
-Hypotheses:           {hyps}
-Theory used:          {theory}
-Variables/constructs: {vars}
-Methodology:          {method}
-Sampling:             {sampling}
-Instrument:           {instrument}
-Analysis technique:   {analysis}
-Key findings:         {findings}
-Conclusions:          {conclusions}
+Title:                TITLE_PLACEHOLDER
+Discipline:           DISCIPLINE_PLACEHOLDER
+Problem statement:    PROBLEM_PLACEHOLDER
+Research gap:         GAP_PLACEHOLDER
+Research questions:   RQS_PLACEHOLDER
+Research objectives:  ROS_PLACEHOLDER
+Hypotheses:           HYPS_PLACEHOLDER
+Theory used:          THEORY_PLACEHOLDER
+Variables/constructs: VARS_PLACEHOLDER
+Methodology:          METHOD_PLACEHOLDER
+Sampling:             SAMPLING_PLACEHOLDER
+Instrument:           INSTRUMENT_PLACEHOLDER
+Analysis technique:   ANALYSIS_PLACEHOLDER
+Key findings:         FINDINGS_PLACEHOLDER
+Conclusions:          CONCLUSIONS_PLACEHOLDER
 
 CRITICAL ISSUES RAISED BY SUBSECTION AUDIT
 ==========================================
-{critical_issues}
+CRITICAL_ISSUES_PLACEHOLDER
 
 YOUR TASK
 =========
-Produce a JSON object with:
-
-{{
+Produce a JSON object:
+{
   "rows": [
-    {{
-      "rq": "RQ1 verbatim or paraphrase",
+    {
+      "rq": "RQ1 verbatim",
       "ro": "RO1 matched to RQ1",
-      "hypothesis": "H1 if applicable, else '—'",
-      "method": "specific method used to answer RQ1",
-      "analysis": "specific analysis technique applied",
-      "finding": "what was found relevant to RQ1",
+      "hypothesis": "H1 if applicable else none",
+      "method": "method used to answer RQ1",
+      "analysis": "analysis technique applied",
+      "finding": "finding relevant to RQ1",
       "conclusion": "conclusion drawn for RQ1",
-      "status": "ALIGNED | PARTIAL | MISALIGNED | MISSING | UNCLEAR",
-      "note": "concrete reason for this status — quote spine fields if possible"
-    }}
-    // one row per research question
+      "status": "ALIGNED or PARTIAL or MISALIGNED or MISSING or UNCLEAR",
+      "note": "concrete reason — quote spine fields where possible"
+    }
   ],
-  "golden_thread_score": "STRONG | ACCEPTABLE | WEAK | BROKEN",
-  "overall_verdict": "2-3 sentence verdict on structural coherence of the thesis",
-  "critical_gaps": [
-    "specific gap 1 — e.g., 'RQ2 is not answered by the analysis technique used (regression cannot test the mediation claimed)'",
-    "specific gap 2"
-  ],
-  "structural_recommendations": [
-    "specific structural fix 1 — name the framework/method to use",
-    "specific structural fix 2"
-  ]
-}}
+  "golden_thread_score": "STRONG or ACCEPTABLE or WEAK or BROKEN",
+  "overall_verdict": "2-3 sentence verdict on structural coherence",
+  "critical_gaps": ["gap 1 with specific explanation", "gap 2"],
+  "structural_recommendations": ["specific fix 1 with named method/framework", "fix 2"]
+}
 
-Return ONLY the JSON object. No prose, no markdown fences.
+Return ONLY the JSON object. No prose, no markdown.\
 """
 
 async def run_alignment_audit(spine: ThesisSpine, chs: list[ChapterSummary]) -> AlignmentMatrix:
@@ -689,27 +759,31 @@ async def run_alignment_audit(spine: ThesisSpine, chs: list[ChapterSummary]) -> 
         return AlignmentMatrix(
             overall_verdict="Alignment audit unavailable — ANTHROPIC_API_KEY not set.",
             golden_thread_score="UNCLEAR")
-    # Compile critical issues from subsection audit for context
     critical_issues = []
     for cs in chs:
         for c in cs.comments:
             if c.severity == "CRITICAL":
                 critical_issues.append(f"Ch.{c.chapter} §{c.subsection}: {c.issue}")
-    critical_block = "\n".join(critical_issues[:30]) or "(no critical issues flagged at subsection level)"
+    critical_block = "\n".join(critical_issues[:30]) or "(none)"
 
-    prompt = _ALIGNMENT_PROMPT.format(
-        title=spine.title, discipline=spine.discipline,
-        problem=spine.problem_statement, gap=spine.research_gap,
-        rqs="; ".join(spine.research_questions) or "NOT FOUND",
-        ros="; ".join(spine.research_objectives) or "NOT FOUND",
-        hyps="; ".join(spine.hypotheses) or "NOT FOUND",
-        theory=spine.theory_used,
-        vars="; ".join(spine.variables) or "NOT FOUND",
-        method=spine.methodology, sampling=spine.sampling,
-        instrument=spine.instrument, analysis=spine.analysis_technique,
-        findings="; ".join(spine.key_findings) or "NOT FOUND",
-        conclusions="; ".join(spine.conclusions) or "NOT FOUND",
-        critical_issues=critical_block,
+    prompt = (
+        _ALIGNMENT_PROMPT_TEMPLATE
+        .replace("TITLE_PLACEHOLDER",       spine.title)
+        .replace("DISCIPLINE_PLACEHOLDER",  spine.discipline)
+        .replace("PROBLEM_PLACEHOLDER",     spine.problem_statement[:400])
+        .replace("GAP_PLACEHOLDER",         spine.research_gap[:300])
+        .replace("RQS_PLACEHOLDER",         "; ".join(spine.research_questions) or "NOT FOUND")
+        .replace("ROS_PLACEHOLDER",         "; ".join(spine.research_objectives) or "NOT FOUND")
+        .replace("HYPS_PLACEHOLDER",        "; ".join(spine.hypotheses) or "NOT FOUND")
+        .replace("THEORY_PLACEHOLDER",      spine.theory_used)
+        .replace("VARS_PLACEHOLDER",        "; ".join(spine.variables) or "NOT FOUND")
+        .replace("METHOD_PLACEHOLDER",      spine.methodology)
+        .replace("SAMPLING_PLACEHOLDER",    spine.sampling)
+        .replace("INSTRUMENT_PLACEHOLDER",  spine.instrument)
+        .replace("ANALYSIS_PLACEHOLDER",    spine.analysis_technique)
+        .replace("FINDINGS_PLACEHOLDER",    "; ".join(spine.key_findings) or "NOT FOUND")
+        .replace("CONCLUSIONS_PLACEHOLDER", "; ".join(spine.conclusions) or "NOT FOUND")
+        .replace("CRITICAL_ISSUES_PLACEHOLDER", critical_block)
     )
     try:
         msg = await claude_client.messages.create(
@@ -720,119 +794,122 @@ async def run_alignment_audit(spine: ThesisSpine, chs: list[ChapterSummary]) -> 
         raw = re.sub(r"```(?:json)?","", raw).strip("`").strip()
         d = json.loads(raw)
         rows = [AlignmentRow(
-            rq=r.get("rq","—"), ro=r.get("ro","—"),
-            hypothesis=r.get("hypothesis","—"), method=r.get("method","—"),
-            analysis=r.get("analysis","—"), finding=r.get("finding","—"),
+            rq=        r.get("rq","—"),         ro=       r.get("ro","—"),
+            hypothesis=r.get("hypothesis","—"),  method=   r.get("method","—"),
+            analysis=  r.get("analysis","—"),    finding=  r.get("finding","—"),
             conclusion=r.get("conclusion","—"),
-            status=r.get("status","UNCLEAR").upper(),
-            note=r.get("note","")) for r in d.get("rows",[])]
-        return AlignmentMatrix(
+            status=    str(r.get("status","UNCLEAR")).upper(),
+            note=      r.get("note",""))
+            for r in d.get("rows",[])]
+        matrix = AlignmentMatrix(
             rows=rows,
-            overall_verdict=d.get("overall_verdict",""),
-            golden_thread_score=d.get("golden_thread_score","UNCLEAR").upper(),
-            critical_gaps=d.get("critical_gaps",[]),
-            structural_recommendations=d.get("structural_recommendations",[]),
+            overall_verdict=            d.get("overall_verdict",""),
+            golden_thread_score=        str(d.get("golden_thread_score","UNCLEAR")).upper(),
+            critical_gaps=              d.get("critical_gaps",[]),
+            structural_recommendations= d.get("structural_recommendations",[]),
         )
+        print(f"[ThesisSifu] Alignment audit: {len(rows)} rows, score={matrix.golden_thread_score}")
+        return matrix
+    except json.JSONDecodeError as e:
+        print(f"[ThesisSifu] Alignment JSON parse error: {e}")
+        return AlignmentMatrix(overall_verdict="Alignment JSON parse failed.", golden_thread_score="UNCLEAR")
     except Exception as e:
-        print(f"Alignment audit error: {e}")
-        return AlignmentMatrix(
-            overall_verdict=f"Alignment audit failed: {e}",
-            golden_thread_score="UNCLEAR")
+        print(f"[ThesisSifu] Alignment audit error: {e}\n{traceback.format_exc()}")
+        return AlignmentMatrix(overall_verdict=f"Alignment audit failed: {e}", golden_thread_score="UNCLEAR")
 
 
-# ── Stage 4: Holistic Examiner (Claude, now spine-aware) ──────
-_EXAMINER_SYSTEM = """
+# ── Stage 4: Holistic Examiner (Claude) ───────────────────────
+_EXAMINER_SYSTEM = """\
 You are a senior academic examiner with 25 years of experience.
 Produce rigorous, specific, honest examiner-level critique anchored to the
 provided thesis spine and alignment matrix. You are NOT a grammar checker —
 you are an intellectual critic. Cite specific spine fields when you make claims.
 Recommend named frameworks (with seminal author) where appropriate.
-Respond in the same language as the document.
+Respond in the same language as the document.\
 """
 
-_EXAMINER_PROMPTS = {
-"PHD": """
+_PHD_EXAMINER = """\
 External examiner for a PhD viva.
 
 THESIS SPINE
 ============
-Title:            "{title}"
-Field:            {field} | Institution: {institution}
-Problem:          {problem}
-Research Qs:      {rqs}
-Research Objs:    {ros}
-Theory:           {theory}
-Methodology:      {method}
-Analysis:         {analysis}
+Title:            "TITLE_PLACEHOLDER"
+Field:            FIELD_PLACEHOLDER | Institution: INST_PLACEHOLDER
+Problem:          PROBLEM_PLACEHOLDER
+Research Qs:      RQS_PLACEHOLDER
+Research Objs:    ROS_PLACEHOLDER
+Theory:           THEORY_PLACEHOLDER
+Methodology:      METHOD_PLACEHOLDER
+Analysis:         ANALYSIS_PLACEHOLDER
 
-ALIGNMENT VERDICT (from dedicated audit)
-========================================
-Golden thread score: {gt_score}
-Overall:             {align_verdict}
-Critical gaps:       {gaps}
+ALIGNMENT VERDICT
+=================
+Golden thread score: GT_SCORE_PLACEHOLDER
+Overall:             ALIGN_VERDICT_PLACEHOLDER
+Critical gaps:
+GAPS_PLACEHOLDER
 
 CHAPTER + SUBSECTION ISSUE SUMMARY
 ===================================
-{summaries}
+SUMMARIES_PLACEHOLDER
 
-CANONICAL LIBRARIES (recommend FROM these — do NOT invent references)
-====================================================================
-{frameworks}
-{methods}
+CANONICAL LIBRARIES (recommend FROM these — do NOT invent references):
+FRAMEWORKS_PLACEHOLDER
+METHODS_PLACEHOLDER
 
-Write a full examiner's report with EXACTLY these sections:
+Write a full examiner report with EXACTLY these sections:
 
 SECTION 1 — ORIGINAL CONTRIBUTION TO KNOWLEDGE
 SECTION 2 — GOLDEN THREAD ANALYSIS
-Use the alignment matrix above. Quote spine fields. Identify exact broken links.
+Use the alignment matrix. Quote spine fields. Identify exact broken links.
 SECTION 3 — CHAPTER + SUBSECTION ALIGNMENT AUDIT
-For each chapter, list which subsections under-delivered on their expected purpose.
+For each chapter, list which subsections under-delivered on expected purpose.
 SECTION 4 — THEORETICAL FRAMEWORK COHERENCE
-Name a specific framework (with seminal author) the candidate should add or strengthen.
+Name a specific framework (with seminal author) to add or strengthen.
 SECTION 5 — METHODOLOGICAL RIGOUR
-Recommend specific named methods (e.g., PLS-SEM via Hair et al. 2017) if appropriate.
+Recommend specific named methods (e.g., PLS-SEM via Hair et al. 2017).
 SECTION 6 — DATA QUALITY & ANALYTICAL DEPTH
 SECTION 7 — SCOPUS-LEVEL LANGUAGE & TONE
-Assess against Q1/Q2 journal standards. Flag specific passages and rewrite needs.
 SECTION 8 — CITATION & REFERENCE INTEGRITY
 SECTION 9 — CRITICAL VIVA QUESTIONS
-List 8 specific questions tied directly to spine and alignment gaps.
+List 8 specific questions tied to spine and alignment gaps.
 SECTION 10 — EXAMINER'S VERDICT
 One of: PASS / PASS WITH MINOR CORRECTIONS / MAJOR REVISIONS REQUIRED / REFER (RESUBMIT) / FAIL
-Formal statement 6-8 sentences. Specific conditions before degree is awarded.
-""",
-"MASTERS": """
+Formal statement 6-8 sentences.\
+"""
+
+_MASTERS_EXAMINER = """\
 Internal reader for a Master's thesis viva.
 
 THESIS SPINE
 ============
-Title:        "{title}"
-Field:        {field} | Institution: {institution}
-Problem:      {problem}
-Research Qs:  {rqs}
-Research Objs:{ros}
-Theory:       {theory}
-Methodology:  {method}
-Analysis:     {analysis}
+Title:         "TITLE_PLACEHOLDER"
+Field:         FIELD_PLACEHOLDER | Institution: INST_PLACEHOLDER
+Problem:       PROBLEM_PLACEHOLDER
+Research Qs:   RQS_PLACEHOLDER
+Research Objs: ROS_PLACEHOLDER
+Theory:        THEORY_PLACEHOLDER
+Methodology:   METHOD_PLACEHOLDER
+Analysis:      ANALYSIS_PLACEHOLDER
 
 ALIGNMENT VERDICT
 =================
-Golden thread score: {gt_score}
-Overall:             {align_verdict}
-Critical gaps:       {gaps}
+Golden thread score: GT_SCORE_PLACEHOLDER
+Overall:             ALIGN_VERDICT_PLACEHOLDER
+Critical gaps:
+GAPS_PLACEHOLDER
 
 CHAPTER + SUBSECTION ISSUE SUMMARY
-==================================
-{summaries}
+====================================
+SUMMARIES_PLACEHOLDER
 
-CANONICAL LIBRARIES (recommend FROM these only)
-================================================
-{frameworks}
-{methods}
+CANONICAL LIBRARIES:
+FRAMEWORKS_PLACEHOLDER
+METHODS_PLACEHOLDER
 
 Write a report with EXACTLY these sections:
 
-SECTION 1 — THESIS ALIGNMENT & GOLDEN THREAD (use the matrix above)
+SECTION 1 — THESIS ALIGNMENT & GOLDEN THREAD
 SECTION 2 — CHAPTER + SUBSECTION ALIGNMENT AUDIT
 SECTION 3 — THEORETICAL FRAMEWORK (recommend named theory + seminal author)
 SECTION 4 — METHODOLOGICAL RIGOUR (recommend named method + seminal author)
@@ -842,127 +919,130 @@ SECTION 7 — CITATION INTEGRITY
 SECTION 8 — CRITICAL VIVA QUESTIONS (5 questions tied to alignment gaps)
 SECTION 9 — EXAMINER'S VERDICT
 One of: PASS / PASS WITH MINOR CORRECTIONS / MAJOR REVISIONS REQUIRED / RESUBMIT
-Top 5 issues that must be resolved.
-""",
-"JOURNAL_ARTICLE": """
+Top 5 issues that must be resolved.\
+"""
+
+_JOURNAL_EXAMINER = """\
 Peer reviewer for a Scopus journal.
 
 ARTICLE SPINE
 =============
-Title:        "{title}"
-Field:        {field}
-Problem:      {problem}
-Research Qs:  {rqs}
-Theory:       {theory}
-Methodology:  {method}
-Analysis:     {analysis}
+Title:       "TITLE_PLACEHOLDER"
+Field:       FIELD_PLACEHOLDER
+Problem:     PROBLEM_PLACEHOLDER
+Research Qs: RQS_PLACEHOLDER
+Theory:      THEORY_PLACEHOLDER
+Methodology: METHOD_PLACEHOLDER
+Analysis:    ANALYSIS_PLACEHOLDER
 
 ALIGNMENT VERDICT
 =================
-Golden thread score: {gt_score}
-Overall:             {align_verdict}
-Critical gaps:       {gaps}
+Golden thread score: GT_SCORE_PLACEHOLDER
+Overall:             ALIGN_VERDICT_PLACEHOLDER
+Critical gaps:
+GAPS_PLACEHOLDER
 
 SECTION ISSUE SUMMARY
 =====================
-{summaries}
+SUMMARIES_PLACEHOLDER
 
-CANONICAL LIBRARIES
-===================
-{frameworks}
-{methods}
+CANONICAL LIBRARIES:
+FRAMEWORKS_PLACEHOLDER
+METHODS_PLACEHOLDER
 
 Write a review with EXACTLY these sections:
 
 SECTION 1 — CONTRIBUTION & NOVELTY
 SECTION 2 — LITERATURE CURRENCY & GAPS
-SECTION 3 — METHODOLOGY (cite named methodological references)
+SECTION 3 — METHODOLOGY
 SECTION 4 — RESULTS & ANALYSIS
-SECTION 5 — ARGUMENT COHERENCE (use alignment matrix above)
+SECTION 5 — ARGUMENT COHERENCE
 SECTION 6 — SCOPUS-LEVEL LANGUAGE & TONE
 SECTION 7 — CITATION INTEGRITY
 SECTION 8 — PUBLICATION VERDICT
 One of: ACCEPT / MINOR REVISIONS / MAJOR REVISIONS / REJECT
-Top 3 critical revisions.
-""",
-"UNDERGRADUATE": """
+Top 3 critical revisions.\
+"""
+
+_UG_EXAMINER = """\
 Supervisor reviewing an undergraduate FYP.
 
 PROJECT SPINE
 =============
-Title:        "{title}"
-Field:        {field}
-Problem:      {problem}
-Research Qs:  {rqs}
-Methodology:  {method}
-Analysis:     {analysis}
+Title:       "TITLE_PLACEHOLDER"
+Field:       FIELD_PLACEHOLDER
+Problem:     PROBLEM_PLACEHOLDER
+Research Qs: RQS_PLACEHOLDER
+Methodology: METHOD_PLACEHOLDER
+Analysis:    ANALYSIS_PLACEHOLDER
 
 ALIGNMENT VERDICT
 =================
-Golden thread score: {gt_score}
-Overall:             {align_verdict}
+Golden thread score: GT_SCORE_PLACEHOLDER
+Overall:             ALIGN_VERDICT_PLACEHOLDER
 
 SECTION ISSUE SUMMARY
 =====================
-{summaries}
+SUMMARIES_PLACEHOLDER
 
-CANONICAL LIBRARIES (recommend FROM these — appropriate for undergraduate level)
-=================================================================================
-{frameworks}
-{methods}
+CANONICAL LIBRARIES:
+FRAMEWORKS_PLACEHOLDER
+METHODS_PLACEHOLDER
 
 Write a report with EXACTLY these sections:
 
-SECTION 1 — SCOPE & RESEARCH QUESTION (alignment with project objectives)
-SECTION 2 — LITERATURE REVIEW (recommend named theory if missing)
-SECTION 3 — METHODOLOGY (recommend named method if appropriate)
+SECTION 1 — SCOPE & RESEARCH QUESTION
+SECTION 2 — LITERATURE REVIEW
+SECTION 3 — METHODOLOGY
 SECTION 4 — ANALYSIS & FINDINGS
 SECTION 5 — CRITICAL THINKING
 SECTION 6 — WRITING & ACADEMIC CONVENTIONS
 SECTION 7 — TOP ISSUES TO FIX
 SECTION 8 — SUPERVISOR'S VERDICT
-One of: PASS / PASS WITH MINOR CORRECTIONS / MAJOR REVISIONS / FAIL
-""",
+One of: PASS / PASS WITH MINOR CORRECTIONS / MAJOR REVISIONS / FAIL\
+"""
+
+_EXAMINER_TEMPLATES = {
+    "PHD": _PHD_EXAMINER, "MASTERS": _MASTERS_EXAMINER,
+    "JOURNAL_ARTICLE": _JOURNAL_EXAMINER, "UNDERGRADUATE": _UG_EXAMINER,
 }
 
-async def run_examiner(doc_type, spine: ThesisSpine, field, inst,
+async def run_examiner(doc_type: str, spine: ThesisSpine, field: str, inst: str,
                        chs: list[ChapterSummary], align: AlignmentMatrix) -> str:
     if not claude_client:
         return "Examiner synthesis unavailable — ANTHROPIC_API_KEY not set."
-
-    # Build per-chapter + per-subsection summary
-    summaries_text = ""
+    # Build summaries
+    summaries = ""
     for cs in chs:
         n_c = sum(1 for c in cs.comments if c.severity=="CRITICAL")
         n_m = sum(1 for c in cs.comments if c.severity=="MODERATE")
-        summaries_text += (f"\nCh.{cs.chapter_num} — {cs.chapter_title}: "
-                           f"{len(cs.comments)} comments "
-                           f"(Critical:{n_c} Moderate:{n_m})\n")
-        # Subsection-level breakdown
+        summaries += (f"\nCh.{cs.chapter_num} — {cs.chapter_title}: "
+                      f"{len(cs.comments)} comments (Critical:{n_c} Moderate:{n_m})\n")
         for sub in cs.subsections:
-            sub_crit = [c for c in sub.comments if c.severity=="CRITICAL"]
-            if sub_crit:
-                summaries_text += f"  §{sub.subsection_num} {sub.title} (purpose: {sub.expected_purpose[:80]})\n"
-                for c in sub_crit[:3]:
-                    summaries_text += f"     [CRITICAL] {c.issue}\n"
-
-    gaps_text = "\n".join(f"  • {g}" for g in align.critical_gaps[:8]) or "  (none recorded)"
-
-    template = _EXAMINER_PROMPTS.get(doc_type, _EXAMINER_PROMPTS["MASTERS"])
-    prompt = template.format(
-        title=spine.title, field=field, institution=inst,
-        problem=spine.problem_statement[:400],
-        rqs="; ".join(spine.research_questions[:5]) or "NOT FOUND",
-        ros="; ".join(spine.research_objectives[:5]) or "NOT FOUND",
-        theory=spine.theory_used,
-        method=spine.methodology,
-        analysis=spine.analysis_technique,
-        gt_score=align.golden_thread_score,
-        align_verdict=align.overall_verdict,
-        gaps=gaps_text,
-        summaries=summaries_text[:8000],
-        frameworks=CANONICAL_FRAMEWORKS,
-        methods=CANONICAL_METHODS,
+            crit = [c for c in sub.comments if c.severity=="CRITICAL"]
+            if crit:
+                summaries += f"  §{sub.subsection_num} {sub.title} [purpose: {sub.expected_purpose[:70]}]\n"
+                for c in crit[:3]:
+                    summaries += f"    [CRITICAL] {c.issue}\n"
+    gaps = "\n".join(f"  * {g}" for g in align.critical_gaps[:8]) or "  (none)"
+    template = _EXAMINER_TEMPLATES.get(doc_type, _MASTERS_EXAMINER)
+    prompt = (
+        template
+        .replace("TITLE_PLACEHOLDER",        spine.title[:200])
+        .replace("FIELD_PLACEHOLDER",         field)
+        .replace("INST_PLACEHOLDER",          inst)
+        .replace("PROBLEM_PLACEHOLDER",       spine.problem_statement[:400])
+        .replace("RQS_PLACEHOLDER",           "; ".join(spine.research_questions[:5]) or "NOT FOUND")
+        .replace("ROS_PLACEHOLDER",           "; ".join(spine.research_objectives[:5]) or "NOT FOUND")
+        .replace("THEORY_PLACEHOLDER",        spine.theory_used)
+        .replace("METHOD_PLACEHOLDER",        spine.methodology)
+        .replace("ANALYSIS_PLACEHOLDER",      spine.analysis_technique)
+        .replace("GT_SCORE_PLACEHOLDER",      align.golden_thread_score)
+        .replace("ALIGN_VERDICT_PLACEHOLDER", align.overall_verdict)
+        .replace("GAPS_PLACEHOLDER",          gaps)
+        .replace("SUMMARIES_PLACEHOLDER",     summaries[:8000])
+        .replace("FRAMEWORKS_PLACEHOLDER",    CANONICAL_FRAMEWORKS)
+        .replace("METHODS_PLACEHOLDER",       CANONICAL_METHODS)
     )
     try:
         msg = await claude_client.messages.create(
@@ -971,17 +1051,15 @@ async def run_examiner(doc_type, spine: ThesisSpine, field, inst,
             messages=[{"role":"user","content":prompt}])
         return msg.content[0].text.strip()
     except Exception as e:
-        print(f"Examiner error: {e}")
+        print(f"[ThesisSifu] Examiner error: {e}\n{traceback.format_exc()}")
         return f"Examiner synthesis failed: {e}"
 
 
-# ── PDF style factory ──────────────────────────────────────────
+# ── PDF helpers ────────────────────────────────────────────────
 def pdf_styles():
     def S(n, **k):
-        k.setdefault("fontName","Times-Roman")
-        k.setdefault("fontSize",11)
-        k.setdefault("leading",16)
-        k.setdefault("textColor",BLACK)
+        k.setdefault("fontName","Times-Roman"); k.setdefault("fontSize",11)
+        k.setdefault("leading",16); k.setdefault("textColor",BLACK)
         k.setdefault("alignment",TA_JUSTIFY)
         return ParagraphStyle(n,**k)
     return {
@@ -993,7 +1071,6 @@ def pdf_styles():
         "ChHead":  S("ChHead",fontName="Helvetica-Bold",fontSize=11,leading=16,textColor=ACCENT,alignment=TA_LEFT,spaceBefore=12,spaceAfter=4),
         "SubHead": S("SubHead",fontName="Helvetica-Bold",fontSize=10,leading=14,textColor=colors.HexColor("#2A5A8A"),alignment=TA_LEFT,spaceBefore=8,spaceAfter=3),
         "Body":    S("Body",leading=18,spaceAfter=6),
-        "Bold":    S("Bold",fontName="Times-Bold",leading=18,spaceAfter=6),
         "Bullet":  S("Bullet",leading=17,leftIndent=16,spaceAfter=4),
         "Verdict": S("Verdict",fontName="Helvetica-Bold",fontSize=15,leading=22,textColor=WHITE,alignment=TA_CENTER),
         "VrdSub":  S("VrdSub",fontName="Helvetica",fontSize=10,leading=14,textColor=WHITE,alignment=TA_CENTER),
@@ -1010,42 +1087,79 @@ def pdf_styles():
 def HR(c=RULE,t=0.5,b=5,a=7):
     return HRFlowable(width="100%",thickness=t,color=c,spaceBefore=b,spaceAfter=a)
 
-def meta_box(S, rows):
-    data=[[Paragraph(f'<font name="Helvetica-Bold">{k}</font>',S["Meta"]),
-           Paragraph(str(v),S["Meta"])] for k,v in rows]
-    t=Table(data,colWidths=[4*cm,W-5*cm-4*cm])
-    t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),BOX_BG),("BOX",(0,0),(-1,-1),.5,RULE),
-        ("INNERGRID",(0,0),(-1,-1),.3,RULE),("TOPPADDING",(0,0),(-1,-1),5),
-        ("BOTTOMPADDING",(0,0),(-1,-1),5),("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8)]))
+def _tbl(data, col_widths, styles):
+    t = Table(data, colWidths=col_widths)
+    t.setStyle(TableStyle(styles))
     return t
 
+def meta_box(S, rows):
+    data = [[Paragraph(f'<font name="Helvetica-Bold">{k}</font>',S["Meta"]),
+             Paragraph(str(v),S["Meta"])] for k,v in rows]
+    return _tbl(data,[4*cm,W-5*cm-4*cm],[
+        ("BACKGROUND",(0,0),(-1,-1),BOX_BG),("BOX",(0,0),(-1,-1),.5,RULE),
+        ("INNERGRID",(0,0),(-1,-1),.3,RULE),("TOPPADDING",(0,0),(-1,-1),5),
+        ("BOTTOMPADDING",(0,0),(-1,-1),5),("LEFTPADDING",(0,0),(-1,-1),8),
+        ("RIGHTPADDING",(0,0),(-1,-1),8),("VALIGN",(0,0),(-1,-1),"TOP")])
+
 def vbanner(S, text, color, subtitle="Examiner's Recommended Outcome"):
-    t=Table([[Paragraph(text.upper(),S["Verdict"])],[Paragraph(subtitle,S["VrdSub"])]],
-            colWidths=[W-5*cm])
-    t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),color),("TOPPADDING",(0,0),(-1,-1),10),
-        ("BOTTOMPADDING",(0,0),(-1,-1),10),("LEFTPADDING",(0,0),(-1,-1),16),("RIGHTPADDING",(0,0),(-1,-1),16)]))
+    t = Table([[Paragraph(text.upper(),S["Verdict"])],[Paragraph(subtitle,S["VrdSub"])]],
+              colWidths=[W-5*cm])
+    t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),color),
+        ("TOPPADDING",(0,0),(-1,-1),10),("BOTTOMPADDING",(0,0),(-1,-1),10),
+        ("LEFTPADDING",(0,0),(-1,-1),16),("RIGHTPADDING",(0,0),(-1,-1),16)]))
     return t
 
 def sev_badge(S, sev, count):
-    t=Table([[Paragraph(f"{sev}: {count}",S["Badge"])]],colWidths=[3.5*cm])
+    t = Table([[Paragraph(f"{sev}: {count}",S["Badge"])]],colWidths=[3.5*cm])
     t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),SEV_COLORS.get(sev,ACCENT)),
         ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
         ("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8)]))
     return t
 
+def type_badge_table(S, text, color):
+    t = Table([[Paragraph(text,S["Badge"])]],colWidths=[W-5*cm])
+    t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),color),
+        ("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7),
+        ("LEFTPADDING",(0,0),(-1,-1),12),("RIGHTPADDING",(0,0),(-1,-1),12)]))
+    return t
+
+def spine_box(S, spine: ThesisSpine):
+    rows = [
+        ("Title",              spine.title[:120]),
+        ("Discipline",         spine.discipline),
+        ("Problem Statement",  spine.problem_statement[:300]),
+        ("Research Gap",       spine.research_gap[:250]),
+        ("Research Questions", "; ".join(spine.research_questions[:6]) or "NOT FOUND"),
+        ("Research Objectives","; ".join(spine.research_objectives[:6]) or "NOT FOUND"),
+        ("Theory Used",        spine.theory_used),
+        ("Variables",          "; ".join(spine.variables[:10]) or "NOT FOUND"),
+        ("Methodology",        spine.methodology),
+        ("Sampling",           spine.sampling),
+        ("Instrument",         spine.instrument),
+        ("Analysis Technique", spine.analysis_technique),
+        ("Key Findings",       "; ".join(spine.key_findings[:4]) or "NOT FOUND"),
+        ("Conclusions",        "; ".join(spine.conclusions[:4]) or "NOT FOUND"),
+    ]
+    data = [[Paragraph(k,S["SpineK"]), Paragraph(str(v),S["SpineV"])] for k,v in rows]
+    return _tbl(data,[4.5*cm,W-5*cm-4.5*cm],[
+        ("BACKGROUND",(0,0),(-1,-1),BOX_BG),("BOX",(0,0),(-1,-1),.5,RULE),
+        ("INNERGRID",(0,0),(-1,-1),.3,RULE),("TOPPADDING",(0,0),(-1,-1),4),
+        ("BOTTOMPADDING",(0,0),(-1,-1),4),("LEFTPADDING",(0,0),(-1,-1),8),
+        ("RIGHTPADDING",(0,0),(-1,-1),8),("VALIGN",(0,0),(-1,-1),"TOP")])
+
 def parse_secs(text):
-    pat=re.compile(r'(?:^|\n)\s*(?:\*{0,2})?SECTION\s+\d+\s*[—–\-]+\s*([^\n*]+?)(?:\*{0,2})?\s*\n',re.IGNORECASE)
-    ms=list(pat.finditer(text))
+    pat = re.compile(r'(?:^|\n)\s*(?:\*{0,2})?SECTION\s+\d+\s*[—–\-]+\s*([^\n*]+?)(?:\*{0,2})?\s*\n',re.IGNORECASE)
+    ms  = list(pat.finditer(text))
     if not ms: return [{"title":"Full Report","body":text.strip()}]
-    out=[]
+    out = []
     for i,m in enumerate(ms):
-        t=m.group(1).strip().rstrip("*").strip()
-        s=m.end(); e=ms[i+1].start() if i+1<len(ms) else len(text)
+        t = m.group(1).strip().rstrip("*").strip()
+        s = m.end(); e = ms[i+1].start() if i+1<len(ms) else len(text)
         out.append({"title":t,"body":text[s:e].strip()})
     return out
 
 def detect_verdict(text):
-    u=text.upper()
+    u = text.upper()
     for lbl,col in [("READY FOR SUBMISSION",GREEN),("ACCEPT",GREEN),
                     ("PASS WITH MINOR CORRECTIONS",AMBER),("MINOR REVISIONS REQUIRED",AMBER),
                     ("MAJOR REVISIONS REQUIRED",RED),("REFER (RESUBMIT)",RED),
@@ -1055,68 +1169,45 @@ def detect_verdict(text):
     return "Review Complete", ACCENT
 
 def body2story(S, body):
-    items=[]
+    items = []
     for line in body.split("\n"):
-        line=line.strip()
+        line = line.strip()
         if not line: items.append(Spacer(1,3)); continue
-        line=re.sub(r'\*\*(.+?)\*\*',r'<b>\1</b>',line)
-        line=re.sub(r'\*(.+?)\*',r'<i>\1</i>',line)
+        line = re.sub(r'\*\*(.+?)\*\*',r'<b>\1</b>',line)
+        line = re.sub(r'\*(.+?)\*',r'<i>\1</i>',line)
         if re.match(r'^[-•]\s+',line): items.append(Paragraph("• "+line[2:],S["Bullet"]))
         elif re.match(r'^\d+[\.\)]\s+',line): items.append(Paragraph(line,S["Bullet"]))
         else: items.append(Paragraph(line,S["Body"]))
     return items
 
-def type_badge_table(S, text, color):
-    t=Table([[Paragraph(text,S["Badge"])]],colWidths=[W-5*cm])
-    t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),color),("TOPPADDING",(0,0),(-1,-1),7),
-        ("BOTTOMPADDING",(0,0),(-1,-1),7),("LEFTPADDING",(0,0),(-1,-1),12),("RIGHTPADDING",(0,0),(-1,-1),12)]))
-    return t
-
-def spine_box(S, spine: ThesisSpine):
-    """Render the extracted thesis spine as a metadata box."""
-    rows = [
-        ("Title",             spine.title[:120]),
-        ("Discipline",        spine.discipline),
-        ("Problem Statement", spine.problem_statement[:300]),
-        ("Research Gap",      spine.research_gap[:250]),
-        ("Research Questions", "; ".join(spine.research_questions[:6]) or "NOT FOUND"),
-        ("Research Objectives","; ".join(spine.research_objectives[:6]) or "NOT FOUND"),
-        ("Theory Used",       spine.theory_used),
-        ("Variables",         "; ".join(spine.variables[:10]) or "NOT FOUND"),
-        ("Methodology",       spine.methodology),
-        ("Sampling",          spine.sampling),
-        ("Instrument",        spine.instrument),
-        ("Analysis Technique",spine.analysis_technique),
-        ("Key Findings",      "; ".join(spine.key_findings[:4]) or "NOT FOUND"),
-        ("Conclusions",       "; ".join(spine.conclusions[:4]) or "NOT FOUND"),
-    ]
-    data = [[Paragraph(k, S["SpineK"]), Paragraph(str(v), S["SpineV"])] for k, v in rows]
-    t = Table(data, colWidths=[4.5*cm, W-5*cm-4.5*cm])
-    t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),BOX_BG),
-        ("BOX",(0,0),(-1,-1),.5,RULE),("INNERGRID",(0,0),(-1,-1),.3,RULE),
-        ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
-        ("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8),
-        ("VALIGN",(0,0),(-1,-1),"TOP")]))
-    return t
+def _comment_text(c: ParagraphComment) -> str:
+    sev = {"CRITICAL":"[CRITICAL]","MODERATE":"[MODERATE]",
+           "SUGGESTION":"[SUGGESTION]"}.get(c.severity,"[NOTE]")
+    fw  = f"\n\nSUGGESTED FRAMEWORK: {c.suggested_framework}" if c.suggested_framework else ""
+    mt  = f"\n\nSUGGESTED METHOD: {c.suggested_method}" if c.suggested_method else ""
+    return (f"{sev} ThesisSifu v4 — §{c.subsection} {c.subsection_title}\n\n"
+            f"ISSUE: {c.issue}\n\n"
+            f"RECOMMENDATION: {c.recommendation}\n\n"
+            f"LITERATURE NEEDED: {c.literature_needed}\n\n"
+            f"THEORY/FRAMEWORK: {c.theory_needed}"
+            f"{fw}{mt}")
 
 
-# ── Output 1: Examiner Report PDF ──────────────────────────────
-def build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text,
-                       align: AlignmentMatrix, chs) -> bytes:
-    buf=io.BytesIO()
-    doc=SimpleDocTemplate(buf,pagesize=A4,leftMargin=2.5*cm,rightMargin=2.5*cm,
-                          topMargin=2.2*cm,bottomMargin=2.2*cm)
-    S=pdf_styles(); story=[]
+# ── Output 1: Examiner Report PDF ─────────────────────────────
+def build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, align, chs) -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf,pagesize=A4,leftMargin=2.5*cm,rightMargin=2.5*cm,
+                            topMargin=2.2*cm,bottomMargin=2.2*cm)
+    S = pdf_styles(); story = []
 
-    type_label=TYPE_LABELS.get(doc_type,doc_type)
+    type_label = TYPE_LABELS.get(doc_type,doc_type)
     story.append(type_badge_table(S,type_label.upper(),TYPE_COLORS.get(doc_type,NAVY)))
     story.append(Spacer(1,14))
     story.append(Paragraph("EXAMINER'S AUDIT REPORT",S["Title"]))
-    story.append(Paragraph("ThesisSifu Pro v4 — Alignment-Aware Multi-Agent Panel",S["Sub"]))
+    story.append(Paragraph("ThesisSifu Pro v4.1 — Alignment-Aware Multi-Agent Panel",S["Sub"]))
     story.append(HR(c=NAVY,t=1.5,b=4,a=10))
 
     au=clf.get("authors","UNKNOWN"); fi=clf.get("field","UNKNOWN"); ins=clf.get("institution","UNKNOWN")
-
     story.append(meta_box(S,[
         ("Document",filename),("Detected As",type_label),
         ("Confidence",clf.get("confidence","N/A")),
@@ -1127,51 +1218,43 @@ def build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text,
     ]))
     story.append(Spacer(1,10))
 
-    # NEW: Thesis Spine summary
     story.append(Paragraph("EXTRACTED THESIS SPINE",S["SecHead"]))
     story.append(HR(c=NAVY,t=1,b=0,a=6))
     story.append(spine_box(S, spine))
     story.append(Spacer(1,10))
 
-    # Severity badges
     nc=sum(1 for cs in chs for c in cs.comments if c.severity=="CRITICAL")
     nm=sum(1 for cs in chs for c in cs.comments if c.severity=="MODERATE")
     ns=sum(1 for cs in chs for c in cs.comments if c.severity=="SUGGESTION")
-    brow=Table([[sev_badge(S,"CRITICAL",nc),Spacer(6,1),
-                 sev_badge(S,"MODERATE",nm),Spacer(6,1),
-                 sev_badge(S,"SUGGESTION",ns)]],
-               colWidths=[3.5*cm,.5*cm,3.5*cm,.5*cm,3.5*cm])
+    brow = Table([[sev_badge(S,"CRITICAL",nc),Spacer(6,1),
+                   sev_badge(S,"MODERATE",nm),Spacer(6,1),
+                   sev_badge(S,"SUGGESTION",ns)]],
+                 colWidths=[3.5*cm,.5*cm,3.5*cm,.5*cm,3.5*cm])
     brow.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE"),
         ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0)]))
     story.append(brow); story.append(Spacer(1,10))
 
-    # Golden thread banner (NEW — distinct from verdict)
     gt = align.golden_thread_score
     gt_color = {"STRONG":GREEN,"ACCEPTABLE":AMBER,"WEAK":RED,"BROKEN":RED}.get(gt, ACCENT)
-    story.append(vbanner(S, f"Golden Thread: {gt}", gt_color,
-                          subtitle="Structural Alignment Score"))
+    story.append(vbanner(S,f"Golden Thread: {gt}",gt_color,subtitle="Structural Alignment Score"))
     story.append(Spacer(1,8))
-
-    # Final verdict banner
-    vl,vc=detect_verdict(examiner_text)
+    vl,vc = detect_verdict(examiner_text)
     story.append(vbanner(S,vl,vc)); story.append(Spacer(1,10)); story.append(HR())
 
     for sec in parse_secs(examiner_text):
-        bl=[Paragraph(sec["title"].upper(),S["SecHead"]),
-            HR(c=ACCENT,t=.7,b=0,a=6)]
+        bl = [Paragraph(sec["title"].upper(),S["SecHead"]),HR(c=ACCENT,t=.7,b=0,a=6)]
         bl.extend(body2story(S,sec["body"])); bl.append(Spacer(1,6))
         story.append(KeepTogether(bl[:3])); story.extend(bl[3:])
 
-    # Chapter+subsection summary table
     story.append(PageBreak())
     story.append(Paragraph("CHAPTER + SUBSECTION ISSUE SUMMARY",S["SecHead"]))
     story.append(HR(c=NAVY,t=1,b=0,a=8))
-    td=[[Paragraph(h,S["TblH"]) for h in ["Chapter / Subsection","Critical","Moderate","Suggestions","Total"]]]
+    td = [[Paragraph(h,S["TblH"]) for h in ["Chapter / Subsection","Critical","Moderate","Suggestions","Total"]]]
     for cs in chs:
         nc2=sum(1 for c in cs.comments if c.severity=="CRITICAL")
         nm2=sum(1 for c in cs.comments if c.severity=="MODERATE")
         ns2=len(cs.comments)-nc2-nm2
-        td.append([Paragraph(f"<b>Ch.{cs.chapter_num} — {cs.chapter_title[:35]}</b>",S["TblC"]),
+        td.append([Paragraph(f"<b>Ch.{cs.chapter_num} — {cs.chapter_title[:40]}</b>",S["TblC"]),
                    Paragraph(str(nc2),S["TblC"]),Paragraph(str(nm2),S["TblC"]),
                    Paragraph(str(ns2),S["TblC"]),Paragraph(str(nc2+nm2+ns2),S["TblC"])])
         for sub in cs.subsections:
@@ -1179,353 +1262,163 @@ def build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text,
             snc=sum(1 for c in sub.comments if c.severity=="CRITICAL")
             snm=sum(1 for c in sub.comments if c.severity=="MODERATE")
             sns=len(sub.comments)-snc-snm
-            td.append([Paragraph(f"   §{sub.subsection_num} {sub.title[:40]}",S["TblCSm"]),
+            td.append([Paragraph(f"   §{sub.subsection_num} {sub.title[:45]}",S["TblCSm"]),
                        Paragraph(str(snc),S["TblCSm"]),Paragraph(str(snm),S["TblCSm"]),
                        Paragraph(str(sns),S["TblCSm"]),Paragraph(str(snc+snm+sns),S["TblCSm"])])
-    cw=W-5*cm
-    t=Table(td,colWidths=[cw*.50,cw*.12,cw*.13,cw*.13,cw*.12])
+    cw = W-5*cm
+    t = Table(td,colWidths=[cw*.52,cw*.12,cw*.12,cw*.12,cw*.12])
     t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),NAVY),("TEXTCOLOR",(0,0),(-1,0),WHITE),
         ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,BOX_BG]),("BOX",(0,0),(-1,-1),.5,RULE),
         ("INNERGRID",(0,0),(-1,-1),.3,RULE),("TOPPADDING",(0,0),(-1,-1),4),
-        ("BOTTOMPADDING",(0,0),(-1,-1),4),("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6)]))
+        ("BOTTOMPADDING",(0,0),(-1,-1),4),("LEFTPADDING",(0,0),(-1,-1),5),
+        ("RIGHTPADDING",(0,0),(-1,-1),5),("VALIGN",(0,0),(-1,-1),"TOP")]))
     story.append(t)
     story.append(Spacer(1,20)); story.append(HR())
-    story.append(Paragraph("ThesisSifu Pro v4 — Alignment-aware academic audit. "
-        "See Report 2 (Annotated Thesis), Report 3 (Commentary Log), "
-        "and Report 4 (Alignment Matrix) in this ZIP.",S["Footer"]))
-
+    story.append(Paragraph("ThesisSifu Pro v4.1 — See Report 2 (Annotated Thesis), "
+        "Report 3 (Commentary Log), Report 4 (Alignment Matrix) in this ZIP.",S["Footer"]))
     doc.build(story); buf.seek(0); return buf.getvalue()
 
 
-# ── Output 4: Alignment Matrix Report PDF (NEW) ────────────────
-def build_alignment_pdf(filename, audit_id, doc_type, clf, spine: ThesisSpine,
-                        align: AlignmentMatrix, chs) -> bytes:
-    buf=io.BytesIO()
-    doc=SimpleDocTemplate(buf,pagesize=A4,leftMargin=2*cm,rightMargin=2*cm,
-                          topMargin=2.2*cm,bottomMargin=2.2*cm)
-    S=pdf_styles(); story=[]
-
-    story.append(type_badge_table(S,"STRUCTURAL ALIGNMENT MATRIX",
-                                   TYPE_COLORS.get(doc_type,NAVY)))
-    story.append(Spacer(1,14))
-    story.append(Paragraph("ALIGNMENT MATRIX REPORT",S["Title"]))
-    story.append(Paragraph("ThesisSifu Pro v4 — Golden Thread Audit",S["Sub"]))
-    story.append(HR(c=NAVY,t=1.5,b=4,a=10))
-
-    story.append(meta_box(S,[
-        ("Document",filename),
-        ("Audit ID",audit_id),
-        ("Date",datetime.now().strftime("%d %B %Y, %H:%M")),
-        ("Report","4 of 4 — Structural Alignment Matrix"),
-    ]))
-    story.append(Spacer(1,10))
-
-    # Golden thread banner
-    gt = align.golden_thread_score
-    gt_color = {"STRONG":GREEN,"ACCEPTABLE":AMBER,"WEAK":RED,"BROKEN":RED}.get(gt, ACCENT)
-    story.append(vbanner(S, f"Golden Thread: {gt}", gt_color,
-                          subtitle="Problem → RQ → RO → Method → Analysis → Finding → Conclusion"))
-    story.append(Spacer(1,10))
-
-    # Overall verdict
-    story.append(Paragraph("OVERALL ALIGNMENT VERDICT", S["SecHead"]))
-    story.append(HR(c=NAVY,t=1,b=0,a=6))
-    story.append(Paragraph(align.overall_verdict or "(no verdict generated)", S["Body"]))
-    story.append(Spacer(1,8))
-
-    # Spine reminder
-    story.append(Paragraph("THESIS SPINE (for reference)", S["SecHead"]))
-    story.append(HR(c=NAVY,t=1,b=0,a=6))
-    story.append(spine_box(S, spine))
-    story.append(Spacer(1,10))
-
-    # Alignment matrix
-    story.append(PageBreak())
-    story.append(Paragraph("ALIGNMENT MATRIX — RQ-LEVEL TRACE", S["SecHead"]))
-    story.append(HR(c=NAVY,t=1,b=0,a=6))
-    story.append(Paragraph(
-        "Each row traces one research question through the thesis. "
-        "<b>Status</b> indicates whether the chain holds together.",
-        S["Body"]))
-    story.append(Spacer(1,6))
-
-    if not align.rows:
-        story.append(Paragraph("<i>No alignment rows produced — likely insufficient spine data.</i>",
-                                S["Body"]))
-    else:
-        headers = ["RQ", "RO / H", "Method + Analysis", "Finding", "Conclusion", "Status"]
-        td = [[Paragraph(f"<b>{h}</b>", S["TblH"]) for h in headers]]
-        for r in align.rows:
-            status_color = ALIGN_COLORS.get(r.status, ACCENT)
-            status_para = Paragraph(
-                f'<font color="{status_color.hexval()}"><b>{r.status}</b></font>',
-                S["TblCSm"])
-            roh = r.ro + (f" / {r.hypothesis}" if r.hypothesis and r.hypothesis != "—" else "")
-            ma  = f"{r.method}<br/><i>{r.analysis}</i>"
-            td.append([
-                Paragraph(r.rq[:120], S["TblCSm"]),
-                Paragraph(roh[:100], S["TblCSm"]),
-                Paragraph(ma[:140], S["TblCSm"]),
-                Paragraph(r.finding[:120], S["TblCSm"]),
-                Paragraph(r.conclusion[:120], S["TblCSm"]),
-                status_para,
-            ])
-        cw = W - 4*cm
-        t = Table(td, colWidths=[cw*.18, cw*.16, cw*.20, cw*.17, cw*.17, cw*.12])
-        t.setStyle(TableStyle([
-            ("BACKGROUND",(0,0),(-1,0),NAVY),("TEXTCOLOR",(0,0),(-1,0),WHITE),
-            ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,BOX_BG]),
-            ("BOX",(0,0),(-1,-1),.5,RULE),("INNERGRID",(0,0),(-1,-1),.3,RULE),
-            ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
-            ("LEFTPADDING",(0,0),(-1,-1),4),("RIGHTPADDING",(0,0),(-1,-1),4),
-            ("VALIGN",(0,0),(-1,-1),"TOP")]))
-        story.append(t)
-        story.append(Spacer(1,10))
-
-        # Row notes
-        story.append(Paragraph("ROW-BY-ROW ALIGNMENT NOTES", S["SecHead"]))
-        story.append(HR(c=NAVY,t=1,b=0,a=6))
-        for i, r in enumerate(align.rows, 1):
-            status_color = ALIGN_COLORS.get(r.status, ACCENT)
-            badge = Table([[Paragraph(r.status, S["Badge"])]], colWidths=[3*cm])
-            badge.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),status_color),
-                ("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3)]))
-            hdr_row = Table([[
-                Paragraph(f"<b>RQ{i}.</b> {r.rq[:140]}", S["Body"]),
-                badge,
-            ]], colWidths=[W-5*cm-3.2*cm, 3*cm])
-            hdr_row.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"),
-                ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0)]))
-            story.append(hdr_row)
-            if r.note:
-                story.append(Paragraph(f"<i>{r.note}</i>", S["Excerpt"]))
-            story.append(Spacer(1,6))
-
-    # Critical gaps
-    if align.critical_gaps:
-        story.append(PageBreak())
-        story.append(Paragraph("CRITICAL STRUCTURAL GAPS", S["SecHead"]))
-        story.append(HR(c=NAVY,t=1,b=0,a=6))
-        for g in align.critical_gaps:
-            story.append(Paragraph(f"• {g}", S["Bullet"]))
-        story.append(Spacer(1,10))
-
-    # Structural recommendations
-    if align.structural_recommendations:
-        story.append(Paragraph("STRUCTURAL RECOMMENDATIONS", S["SecHead"]))
-        story.append(HR(c=NAVY,t=1,b=0,a=6))
-        for rec in align.structural_recommendations:
-            story.append(Paragraph(f"• {rec}", S["Bullet"]))
-        story.append(Spacer(1,10))
-
-    # Chapter delivery scorecard — does each chapter deliver on its expected purpose?
-    story.append(PageBreak())
-    story.append(Paragraph("CHAPTER DELIVERY SCORECARD", S["SecHead"]))
-    story.append(HR(c=NAVY,t=1,b=0,a=6))
-    story.append(Paragraph(
-        "Did each chapter/subsection deliver on its <b>expected purpose</b>? "
-        "A high count of critical issues against a subsection signals it has not.",
-        S["Body"]))
-    story.append(Spacer(1,6))
-
-    headers = ["Chapter / Subsection", "Expected Purpose", "Issues (C / M / S)"]
-    td = [[Paragraph(f"<b>{h}</b>", S["TblH"]) for h in headers]]
-    for cs in chs:
-        td.append([
-            Paragraph(f"<b>Ch.{cs.chapter_num} — {cs.chapter_title[:50]}</b>", S["TblC"]),
-            Paragraph("(see subsections below)", S["TblCSm"]),
-            Paragraph(f"{sum(1 for c in cs.comments if c.severity=='CRITICAL')} / "
-                       f"{sum(1 for c in cs.comments if c.severity=='MODERATE')} / "
-                       f"{sum(1 for c in cs.comments if c.severity=='SUGGESTION')}", S["TblC"]),
-        ])
-        for sub in cs.subsections:
-            snc=sum(1 for c in sub.comments if c.severity=="CRITICAL")
-            snm=sum(1 for c in sub.comments if c.severity=="MODERATE")
-            sns=len(sub.comments)-snc-snm
-            td.append([
-                Paragraph(f"   §{sub.subsection_num} {sub.title[:50]}", S["TblCSm"]),
-                Paragraph(sub.expected_purpose[:120], S["TblCSm"]),
-                Paragraph(f"{snc} / {snm} / {sns}", S["TblCSm"]),
-            ])
-    cw = W - 4*cm
-    t = Table(td, colWidths=[cw*.34, cw*.50, cw*.16])
-    t.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,0),NAVY),("TEXTCOLOR",(0,0),(-1,0),WHITE),
-        ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,BOX_BG]),
-        ("BOX",(0,0),(-1,-1),.5,RULE),("INNERGRID",(0,0),(-1,-1),.3,RULE),
-        ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
-        ("VALIGN",(0,0),(-1,-1),"TOP")]))
-    story.append(t)
-    story.append(Spacer(1,16)); story.append(HR())
-
-    story.append(Paragraph(
-        "ThesisSifu Pro v4 — Structural Alignment Matrix. "
-        "Use alongside Report 1 (Examiner Audit) and Report 3 (Commentary Log) "
-        "to triangulate revision priorities.",
-        S["Footer"]))
-
-    doc.build(story); buf.seek(0); return buf.getvalue()
-
-
-# ── Output 2: Annotated DOCX ───────────────────────────────────
+# ── Output 2: Annotated DOCX ──────────────────────────────────
 def _get_or_create_comments_part(doc):
-    comments_reltype = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments'
+    rt = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments'
     for rel in doc.part.rels.values():
-        if rel.reltype == comments_reltype:
-            return rel.target_part
+        if rel.reltype == rt: return rel.target_part
     xml_str = '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
     element = parse_xml(xml_str)
     uri = PackURI('/word/comments.xml')
-    ct = 'application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml'
-    cp = XmlPart(uri, ct, element, doc.part.package)
-    doc.part.relate_to(cp, comments_reltype)
+    ct  = 'application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml'
+    cp  = XmlPart(uri, ct, element, doc.part.package)
+    doc.part.relate_to(cp, rt)
     return cp
-
 
 def _insert_comment(doc, para, cid, author, text, date_str):
     cp = _get_or_create_comments_part(doc)
-    comments_root = cp.element
-
-    comment_el = OxmlElement('w:comment')
-    comment_el.set(qn('w:id'), str(cid))
-    comment_el.set(qn('w:author'), author)
-    comment_el.set(qn('w:date'), date_str)
-    comment_el.set(qn('w:initials'), 'TS')
-
-    p_el = OxmlElement('w:p')
-    r_el = OxmlElement('w:r')
-    t_el = OxmlElement('w:t')
-    t_el.text = text
-    t_el.set(qn('xml:space'), 'preserve')
-    r_el.append(t_el); p_el.append(r_el); comment_el.append(p_el)
-    comments_root.append(comment_el)
-
+    ce = OxmlElement('w:comment')
+    ce.set(qn('w:id'),str(cid)); ce.set(qn('w:author'),author)
+    ce.set(qn('w:date'),date_str); ce.set(qn('w:initials'),'TS')
+    pe = OxmlElement('w:p'); re_ = OxmlElement('w:r'); te = OxmlElement('w:t')
+    te.text = text; te.set(qn('xml:space'),'preserve')
+    re_.append(te); pe.append(re_); ce.append(pe)
+    cp.element.append(ce)
     px = para._p
-    crs = OxmlElement('w:commentRangeStart')
-    crs.set(qn('w:id'), str(cid)); px.insert(0, crs)
-    cre = OxmlElement('w:commentRangeEnd')
-    cre.set(qn('w:id'), str(cid)); px.append(cre)
-    rr  = OxmlElement('w:r')
-    rpr = OxmlElement('w:rPr')
-    rs  = OxmlElement('w:rStyle')
-    rs.set(qn('w:val'), 'CommentReference')
+    crs = OxmlElement('w:commentRangeStart'); crs.set(qn('w:id'),str(cid)); px.insert(0,crs)
+    cre = OxmlElement('w:commentRangeEnd');   cre.set(qn('w:id'),str(cid)); px.append(cre)
+    rr  = OxmlElement('w:r'); rpr = OxmlElement('w:rPr')
+    rs  = OxmlElement('w:rStyle'); rs.set(qn('w:val'),'CommentReference')
     rpr.append(rs); rr.append(rpr)
-    cr  = OxmlElement('w:commentReference')
-    cr.set(qn('w:id'), str(cid)); rr.append(cr); px.append(rr)
-
-
-def _comment_text(c: ParagraphComment) -> str:
-    """Format a comment for inline Word/PDF display — now includes subsection +
-    suggested framework/method fields."""
-    sev = {"CRITICAL":"[CRITICAL]","MODERATE":"[MODERATE]",
-           "SUGGESTION":"[SUGGESTION]"}.get(c.severity,"[NOTE]")
-    fw  = f"\n\nSUGGESTED FRAMEWORK: {c.suggested_framework}" if c.suggested_framework else ""
-    mt  = f"\n\nSUGGESTED METHOD/REFERENCE: {c.suggested_method}" if c.suggested_method else ""
-    return (f"{sev} ThesisSifu Pro v4 — §{c.subsection} {c.subsection_title}\n\n"
-            f"ISSUE: {c.issue}\n\n"
-            f"RECOMMENDATION: {c.recommendation}\n\n"
-            f"LITERATURE NEEDED: {c.literature_needed}\n\n"
-            f"THEORY/FRAMEWORK: {c.theory_needed}"
-            f"{fw}{mt}")
-
+    cr  = OxmlElement('w:commentReference'); cr.set(qn('w:id'),str(cid)); rr.append(cr); px.append(rr)
 
 def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
     doc = DocxDocument(io.BytesIO(content))
     date_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
-
     cp = _get_or_create_comments_part(doc)
-    existing_ids = []
-    for comment in cp.element.xpath('.//w:comment'):
-        c_id = comment.get(qn('w:id'))
-        if c_id is not None:
-            existing_ids.append(int(c_id))
-    cid = max(existing_ids) + 1 if existing_ids else 0
+    existing_ids = [int(c.get(qn('w:id'))) for c in cp.element.xpath('.//w:comment')
+                    if c.get(qn('w:id')) is not None]
+    cid = max(existing_ids)+1 if existing_ids else 0
 
-    lookup: dict[str, list] = {}
+    lookup: dict[str,list] = {}
     for cs in chs:
         for c in cs.comments:
             key = c.para_excerpt[:50].lower().strip()
-            lookup.setdefault(key, []).append(c)
+            lookup.setdefault(key,[]).append(c)
 
     matched = set()
     for para in doc.paragraphs:
-        if not para.text.strip() or len(para.text.strip()) < 30:
-            continue
-        pkey = para.text[:50].lower().strip()
+        pt = para.text.strip()
+        if not pt or len(pt) < 30: continue
+        pkey = pt[:50].lower().strip()
         best, best_sc = None, 0
         for ekey, cmts in lookup.items():
             aw = set(pkey.split()); bw = set(ekey.split())
-            sc = len(aw & bw) / max(len(aw), 1)
-            if sc > best_sc and sc > 0.35:
+            sc = len(aw & bw) / max(len(aw),1)
+            if sc > best_sc and sc > 0.30:
                 best_sc = sc; best = (ekey, cmts)
         if best:
             for c in best[1]:
                 if id(c) in matched: continue
                 matched.add(id(c))
                 try:
-                    _insert_comment(doc, para, cid, "ThesisSifu Pro v4",
-                                    _comment_text(c), date_str)
+                    _insert_comment(doc, para, cid, "ThesisSifu v4", _comment_text(c), date_str)
                     cid += 1
                 except Exception as e:
-                    print(f"Comment insert error {cid}: {e}")
+                    print(f"[ThesisSifu] DOCX comment insert error {cid}: {e}")
                     cid += 1
 
     hdr = doc.sections[0].header
     if hdr.paragraphs:
-        hdr.paragraphs[0].text = (
-            f"ThesisSifu Pro v4 | Annotated Thesis | Audit ID: {audit_id} | "
-            f"{datetime.now().strftime('%d %B %Y')}"
-        )
+        hdr.paragraphs[0].text = (f"ThesisSifu Pro v4 | Annotated Thesis | "
+                                   f"Audit ID: {audit_id} | {datetime.now().strftime('%d %B %Y')}")
     buf = io.BytesIO(); doc.save(buf); buf.seek(0); return buf.getvalue()
 
 
-def build_annotated_pdf(content: bytes, filename: str, audit_id: str, chs: list) -> bytes:
-    doc = fitz.open(stream=content, filetype="pdf")
+# ── Output 2 (PDF): Annotated PDF (Sticky Notes) ─────────────
+def build_annotated_pdf(content: bytes, full_text: str, audit_id: str, chs: list) -> bytes:
+    fitz_doc = fitz.open(stream=content, filetype="pdf")
+    total_pages = len(fitz_doc)
+    annotated_count = 0
+
     for cs in chs:
         for c in cs.comments:
-            search_text = c.para_excerpt[:35].replace('\n', ' ').strip()
-            start_page = max(0, c.page_estimate - 2)
-            end_page = min(len(doc), c.page_estimate + 2)
-            annotated = False
             txt = _comment_text(c)
+            search_text = c.para_excerpt[:40].replace('\n',' ').strip()
+            if not search_text:
+                continue
 
-            for p_num in range(start_page, end_page):
-                page = doc[p_num]
+            # Search a wider window around page estimate
+            pg_est = max(0, c.page_estimate - 1)
+            search_pages = list(range(
+                max(0, pg_est - 3),
+                min(total_pages, pg_est + 4)))
+
+            placed = False
+            for p_num in search_pages:
+                page  = fitz_doc[p_num]
                 rects = page.search_for(search_text)
+                if not rects:
+                    # Try shorter search
+                    rects = page.search_for(search_text[:20])
                 if rects:
-                    rect = rects[0]
-                    point = fitz.Point(rect.x0 - 15, rect.y0)
+                    rect  = rects[0]
+                    point = fitz.Point(max(0, rect.x0 - 15), rect.y0)
                     annot = page.add_text_annot(point, txt)
                     annot.set_info(title="ThesisSifu Pro v4", content=txt)
-                    if c.severity == "CRITICAL":   annot.set_colors(stroke=(1, 0, 0))
-                    elif c.severity == "MODERATE": annot.set_colors(stroke=(1, 0.5, 0))
-                    else:                           annot.set_colors(stroke=(0, 0, 1))
-                    annot.update(); annotated = True; break
+                    if   c.severity=="CRITICAL":   annot.set_colors(stroke=(0.8,0,0))
+                    elif c.severity=="MODERATE":   annot.set_colors(stroke=(0.9,0.4,0))
+                    else:                           annot.set_colors(stroke=(0,0,0.8))
+                    annot.update()
+                    placed = True
+                    annotated_count += 1
+                    break
 
-            if not annotated:
-                fallback_page = min(c.page_estimate - 1, len(doc) - 1)
-                page = doc[max(0, fallback_page)]
+            if not placed:
+                # Fallback: place on estimated page, top margin
+                fb = min(pg_est, total_pages-1)
+                page  = fitz_doc[fb]
                 point = fitz.Point(30, 30)
-                annot = page.add_text_annot(point, f"[TEXT NOT FOUND ON PAGE]\n{txt}")
-                annot.set_colors(stroke=(0.5, 0.5, 0.5)); annot.update()
-    return doc.write()
+                annot = page.add_text_annot(point, f"[APPROX LOCATION]\n{txt}")
+                annot.set_colors(stroke=(0.5,0.5,0.5))
+                annot.update()
+                annotated_count += 1
+
+    print(f"[ThesisSifu] PDF annotations placed: {annotated_count}")
+    return fitz_doc.write()
 
 
-# ── Output 3: Commentary Report PDF (subsection-grouped) ──────
+# ── Output 3: Commentary Report PDF ───────────────────────────
 def build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs) -> bytes:
-    buf=io.BytesIO()
-    doc=SimpleDocTemplate(buf,pagesize=A4,leftMargin=2.5*cm,rightMargin=2.5*cm,
-                          topMargin=2.2*cm,bottomMargin=2.2*cm)
-    S=pdf_styles(); story=[]
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf,pagesize=A4,leftMargin=2.5*cm,rightMargin=2.5*cm,
+                            topMargin=2.2*cm,bottomMargin=2.2*cm)
+    S = pdf_styles(); story = []
 
-    story.append(type_badge_table(S,"PARAGRAPH-LEVEL COMMENTARY REPORT",
-                                  TYPE_COLORS.get(doc_type,NAVY)))
+    story.append(type_badge_table(S,"PARAGRAPH-LEVEL COMMENTARY REPORT",TYPE_COLORS.get(doc_type,NAVY)))
     story.append(Spacer(1,14))
     story.append(Paragraph("COMMENTARY REPORT",S["Title"]))
-    story.append(Paragraph("ThesisSifu Pro v4 — Subsection-Level Supervisor Notes",S["Sub"]))
+    story.append(Paragraph("ThesisSifu Pro v4.1 — Subsection-Level Supervisor Notes",S["Sub"]))
     story.append(HR(c=NAVY,t=1.5,b=4,a=10))
 
-    au=clf.get("authors","UNKNOWN")
+    au = clf.get("authors","UNKNOWN")
     story.append(meta_box(S,[
         ("Document",filename),("Type",TYPE_LABELS.get(doc_type,doc_type)),
         ("Title",(spine.title[:85]+"…") if len(spine.title)>85 else spine.title),
@@ -1535,97 +1428,214 @@ def build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs) -> bytes
     ]))
     story.append(Spacer(1,10))
 
-    all_c=[c for cs in chs for c in cs.comments]
-    nc=sum(1 for c in all_c if c.severity=="CRITICAL")
-    nm=sum(1 for c in all_c if c.severity=="MODERATE")
-    ns=sum(1 for c in all_c if c.severity=="SUGGESTION")
+    all_c = [c for cs in chs for c in cs.comments]
+    nc = sum(1 for c in all_c if c.severity=="CRITICAL")
+    nm = sum(1 for c in all_c if c.severity=="MODERATE")
+    ns = sum(1 for c in all_c if c.severity=="SUGGESTION")
 
     story.append(Paragraph("OVERALL COMMENT DISTRIBUTION",S["SecHead"]))
-    cw=W-5*cm
-    td=[[Paragraph(h,S["TblH"]) for h in ["Severity","Count","Description"]],
-        [Paragraph("CRITICAL",S["TblC"]),Paragraph(str(nc),S["TblC"]),
-         Paragraph("Fundamental flaws requiring resolution",S["TblC"])],
-        [Paragraph("MODERATE",S["TblC"]),Paragraph(str(nm),S["TblC"]),
-         Paragraph("Significant weaknesses requiring revision",S["TblC"])],
-        [Paragraph("SUGGESTION",S["TblC"]),Paragraph(str(ns),S["TblC"]),
-         Paragraph("Improvement opportunities",S["TblC"])],
-        [Paragraph("TOTAL",S["TblC"]),Paragraph(str(len(all_c)),S["TblC"]),
-         Paragraph("",S["TblC"])]]
-    t=Table(td,colWidths=[cw*.22,cw*.12,cw*.66])
+    cw = W-5*cm
+    td = [[Paragraph(h,S["TblH"]) for h in ["Severity","Count","Description"]],
+          [Paragraph("CRITICAL",S["TblC"]),Paragraph(str(nc),S["TblC"]),
+           Paragraph("Fundamental flaws requiring resolution",S["TblC"])],
+          [Paragraph("MODERATE",S["TblC"]),Paragraph(str(nm),S["TblC"]),
+           Paragraph("Significant weaknesses requiring revision",S["TblC"])],
+          [Paragraph("SUGGESTION",S["TblC"]),Paragraph(str(ns),S["TblC"]),
+           Paragraph("Improvement opportunities",S["TblC"])],
+          [Paragraph("TOTAL",S["TblC"]),Paragraph(str(len(all_c)),S["TblC"]),Paragraph("",S["TblC"])]]
+    t = Table(td,colWidths=[cw*.22,cw*.12,cw*.66])
     t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),NAVY),("TEXTCOLOR",(0,0),(-1,0),WHITE),
         ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,BOX_BG]),("BOX",(0,0),(-1,-1),.5,RULE),
         ("INNERGRID",(0,0),(-1,-1),.3,RULE),("TOPPADDING",(0,0),(-1,-1),5),
-        ("BOTTOMPADDING",(0,0),(-1,-1),5),("LEFTPADDING",(0,0),(-1,-1),7),("RIGHTPADDING",(0,0),(-1,-1),7)]))
+        ("BOTTOMPADDING",(0,0),(-1,-1),5),("LEFTPADDING",(0,0),(-1,-1),7),
+        ("RIGHTPADDING",(0,0),(-1,-1),7)]))
     story.append(t); story.append(Spacer(1,16)); story.append(HR())
 
-    for cs in chs:
-        if not cs.comments: continue
-        story.append(Paragraph(f"CHAPTER {cs.chapter_num} — {cs.chapter_title.upper()}",S["ChHead"]))
-        nc2=sum(1 for c in cs.comments if c.severity=="CRITICAL")
-        nm2=sum(1 for c in cs.comments if c.severity=="MODERATE")
-        story.append(Paragraph(
-            f"<b>{len(cs.comments)} comments</b> — "
-            f"Critical: {nc2} | Moderate: {nm2} | Suggestions: {len(cs.comments)-nc2-nm2}",
-            S["Body"]))
-        story.append(HR(c=RULE,t=.4,b=2,a=6))
+    if not all_c:
+        story.append(Paragraph("<i>No paragraph comments were generated. "
+            "Check Railway logs for API errors or empty document detection.</i>",S["Body"]))
+    else:
+        for cs in chs:
+            if not cs.comments: continue
+            story.append(Paragraph(f"CHAPTER {cs.chapter_num} — {cs.chapter_title.upper()}",S["ChHead"]))
+            nc2=sum(1 for c in cs.comments if c.severity=="CRITICAL")
+            nm2=sum(1 for c in cs.comments if c.severity=="MODERATE")
+            story.append(Paragraph(f"<b>{len(cs.comments)} comments</b> — "
+                f"Critical: {nc2} | Moderate: {nm2} | Suggestions: {len(cs.comments)-nc2-nm2}",S["Body"]))
+            story.append(HR(c=RULE,t=.4,b=2,a=6))
 
-        # Group by subsection
-        for sub in cs.subsections:
-            if not sub.comments: continue
-            story.append(Paragraph(
-                f"§{sub.subsection_num} — {sub.title}", S["SubHead"]))
-            story.append(Paragraph(
-                f"<i>Expected purpose: {sub.expected_purpose}</i>", S["Excerpt"]))
-            story.append(Spacer(1,4))
+            for sub in cs.subsections:
+                if not sub.comments: continue
+                story.append(Paragraph(f"§{sub.subsection_num} — {sub.title}",S["SubHead"]))
+                story.append(Paragraph(f"<i>Expected purpose: {sub.expected_purpose}</i>",S["Excerpt"]))
+                story.append(Spacer(1,4))
 
-            for i, c in enumerate(sub.comments, 1):
-                sc = SEV_COLORS.get(c.severity, ACCENT)
-
-                hdr_row = Table(
-                    [[Paragraph(c.severity,S["Badge"]),Spacer(6,1),
-                      Paragraph(f"§{sub.subsection_num} Comment {i} | Page ~{c.page_estimate}",S["Meta"])]],
-                    colWidths=[2.2*cm,.4*cm,W-5*cm-2.6*cm])
-                hdr_row.setStyle(TableStyle([("BACKGROUND",(0,0),(0,0),sc),
-                    ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
-                    ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
-                    ("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
-
-                excerpt_box = Table(
-                    [[Paragraph(f'<i>"{c.para_excerpt[:120]}..."</i>',S["Excerpt"])]],
-                    colWidths=[W-5*cm])
-                excerpt_box.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),LGRAY),
-                    ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
-                    ("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8)]))
-
-                fw_line = f'<br/><br/><b>Suggested framework:</b> {c.suggested_framework}' if c.suggested_framework else ""
-                mt_line = f'<br/><br/><b>Suggested method/reference:</b> {c.suggested_method}' if c.suggested_method else ""
-
-                detail_box = Table(
-                    [[Paragraph(
-                        f'<b>Issue:</b> {c.issue}<br/><br/>'
-                        f'<b>Recommendation:</b> {c.recommendation}<br/><br/>'
-                        f'<b>Literature needed:</b> {c.literature_needed}<br/><br/>'
-                        f'<b>Theory / Framework:</b> {c.theory_needed}'
-                        f'{fw_line}{mt_line}',
-                        S["Detail"])]],
-                    colWidths=[W-5*cm])
-                detail_box.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),BOX_BG),
-                    ("BOX",(0,0),(-1,-1),.4,RULE),("TOPPADDING",(0,0),(-1,-1),7),
-                    ("BOTTOMPADDING",(0,0),(-1,-1),7),("LEFTPADDING",(0,0),(-1,-1),10),
-                    ("RIGHTPADDING",(0,0),(-1,-1),10)]))
-
-                block=[hdr_row,excerpt_box,detail_box,Spacer(1,8)]
-                story.append(KeepTogether(block[:2])); story.extend(block[2:])
-
-        story.append(Spacer(1,12)); story.append(HR())
+                for i, c in enumerate(sub.comments,1):
+                    sc = SEV_COLORS.get(c.severity,ACCENT)
+                    hdr_row = Table(
+                        [[Paragraph(c.severity,S["Badge"]),Spacer(6,1),
+                          Paragraph(f"§{sub.subsection_num} Comment {i} | Page ~{c.page_estimate}",S["Meta"])]],
+                        colWidths=[2.2*cm,.4*cm,W-5*cm-2.6*cm])
+                    hdr_row.setStyle(TableStyle([("BACKGROUND",(0,0),(0,0),sc),
+                        ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+                        ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
+                        ("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+                    excerpt_box = Table(
+                        [[Paragraph(f'<i>"{c.para_excerpt[:120]}..."</i>',S["Excerpt"])]],
+                        colWidths=[W-5*cm])
+                    excerpt_box.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),LGRAY),
+                        ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
+                        ("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8)]))
+                    fw_line = f'<br/><br/><b>Suggested framework:</b> {c.suggested_framework}' if c.suggested_framework else ""
+                    mt_line = f'<br/><br/><b>Suggested method/reference:</b> {c.suggested_method}' if c.suggested_method else ""
+                    detail_box = Table(
+                        [[Paragraph(
+                            f'<b>Issue:</b> {c.issue}<br/><br/>'
+                            f'<b>Recommendation:</b> {c.recommendation}<br/><br/>'
+                            f'<b>Literature needed:</b> {c.literature_needed}<br/><br/>'
+                            f'<b>Theory / Framework:</b> {c.theory_needed}'
+                            f'{fw_line}{mt_line}',S["Detail"])]],
+                        colWidths=[W-5*cm])
+                    detail_box.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),BOX_BG),
+                        ("BOX",(0,0),(-1,-1),.4,RULE),("TOPPADDING",(0,0),(-1,-1),7),
+                        ("BOTTOMPADDING",(0,0),(-1,-1),7),("LEFTPADDING",(0,0),(-1,-1),10),
+                        ("RIGHTPADDING",(0,0),(-1,-1),10)]))
+                    block = [hdr_row,excerpt_box,detail_box,Spacer(1,8)]
+                    story.append(KeepTogether(block[:2])); story.extend(block[2:])
+            story.append(Spacer(1,12)); story.append(HR())
 
     story.append(Spacer(1,6))
-    story.append(Paragraph(
-        "ThesisSifu Pro v4 — Subsection-level paragraph commentary log. "
-        "See Report 1 (Examiner Audit) for holistic verdict, "
-        "Report 2 (Annotated Thesis) for inline comments, "
-        "and Report 4 (Alignment Matrix) for structural verification.",S["Footer"]))
+    story.append(Paragraph("ThesisSifu Pro v4.1 — Subsection commentary. "
+        "See Report 1 (Examiner Audit), Report 2 (Annotated Thesis), "
+        "Report 4 (Alignment Matrix).",S["Footer"]))
+    doc.build(story); buf.seek(0); return buf.getvalue()
 
+
+# ── Output 4: Alignment Matrix Report PDF ─────────────────────
+def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf,pagesize=A4,leftMargin=2*cm,rightMargin=2*cm,
+                            topMargin=2.2*cm,bottomMargin=2.2*cm)
+    S = pdf_styles(); story = []
+
+    story.append(type_badge_table(S,"STRUCTURAL ALIGNMENT MATRIX",TYPE_COLORS.get(doc_type,NAVY)))
+    story.append(Spacer(1,14))
+    story.append(Paragraph("ALIGNMENT MATRIX REPORT",S["Title"]))
+    story.append(Paragraph("ThesisSifu Pro v4.1 — Golden Thread Audit",S["Sub"]))
+    story.append(HR(c=NAVY,t=1.5,b=4,a=10))
+    story.append(meta_box(S,[("Document",filename),("Audit ID",audit_id),
+        ("Date",datetime.now().strftime("%d %B %Y, %H:%M")),
+        ("Report","4 of 4 — Structural Alignment Matrix")]))
+    story.append(Spacer(1,10))
+
+    gt = align.golden_thread_score
+    gt_color = {"STRONG":GREEN,"ACCEPTABLE":AMBER,"WEAK":RED,"BROKEN":RED}.get(gt,ACCENT)
+    story.append(vbanner(S,f"Golden Thread: {gt}",gt_color,
+        subtitle="Problem -> RQ -> RO -> Method -> Analysis -> Finding -> Conclusion"))
+    story.append(Spacer(1,10))
+
+    story.append(Paragraph("OVERALL ALIGNMENT VERDICT",S["SecHead"]))
+    story.append(HR(c=NAVY,t=1,b=0,a=6))
+    story.append(Paragraph(align.overall_verdict or "(no verdict generated)",S["Body"]))
+    story.append(Spacer(1,8))
+
+    story.append(Paragraph("THESIS SPINE (for reference)",S["SecHead"]))
+    story.append(HR(c=NAVY,t=1,b=0,a=6))
+    story.append(spine_box(S,spine)); story.append(Spacer(1,10))
+
+    story.append(PageBreak())
+    story.append(Paragraph("ALIGNMENT MATRIX — RQ-LEVEL TRACE",S["SecHead"]))
+    story.append(HR(c=NAVY,t=1,b=0,a=6))
+
+    if not align.rows:
+        story.append(Paragraph("<i>No alignment rows produced. "
+            "This usually means the spine extraction could not identify Research Questions. "
+            "Check that the document has clear RQ/RO statements and the GEMINI_API_KEY is valid.</i>",S["Body"]))
+    else:
+        headers = ["RQ","RO / H","Method + Analysis","Finding","Conclusion","Status"]
+        td = [[Paragraph(f"<b>{h}</b>",S["TblH"]) for h in headers]]
+        for r in align.rows:
+            sc = ALIGN_COLORS.get(r.status,ACCENT)
+            roh = r.ro + (f" / {r.hypothesis}" if r.hypothesis and r.hypothesis!="—" else "")
+            td.append([
+                Paragraph(r.rq[:100],S["TblCSm"]),
+                Paragraph(roh[:90],S["TblCSm"]),
+                Paragraph(f"{r.method[:60]}\n{r.analysis[:60]}",S["TblCSm"]),
+                Paragraph(r.finding[:90],S["TblCSm"]),
+                Paragraph(r.conclusion[:90],S["TblCSm"]),
+                Paragraph(f'<font color="{sc.hexval()}"><b>{r.status}</b></font>',S["TblCSm"]),
+            ])
+        cw = W-4*cm
+        t = Table(td,colWidths=[cw*.18,cw*.15,cw*.20,cw*.17,cw*.17,cw*.13])
+        t.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0),NAVY),("TEXTCOLOR",(0,0),(-1,0),WHITE),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,BOX_BG]),
+            ("BOX",(0,0),(-1,-1),.5,RULE),("INNERGRID",(0,0),(-1,-1),.3,RULE),
+            ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+            ("LEFTPADDING",(0,0),(-1,-1),4),("RIGHTPADDING",(0,0),(-1,-1),4),
+            ("VALIGN",(0,0),(-1,-1),"TOP")]))
+        story.append(t); story.append(Spacer(1,10))
+
+        story.append(Paragraph("ROW-BY-ROW NOTES",S["SecHead"]))
+        story.append(HR(c=NAVY,t=1,b=0,a=6))
+        for i,r in enumerate(align.rows,1):
+            sc = ALIGN_COLORS.get(r.status,ACCENT)
+            badge = Table([[Paragraph(r.status,S["Badge"])]],colWidths=[3*cm])
+            badge.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),sc),
+                ("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3)]))
+            hrow = Table([[Paragraph(f"<b>RQ{i}.</b> {r.rq[:140]}",S["Body"]),badge]],
+                          colWidths=[W-5*cm-3.2*cm,3*cm])
+            hrow.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"),
+                ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0)]))
+            story.append(hrow)
+            if r.note: story.append(Paragraph(f"<i>{r.note}</i>",S["Excerpt"]))
+            story.append(Spacer(1,6))
+
+    if align.critical_gaps:
+        story.append(PageBreak())
+        story.append(Paragraph("CRITICAL STRUCTURAL GAPS",S["SecHead"]))
+        story.append(HR(c=NAVY,t=1,b=0,a=6))
+        for g in align.critical_gaps:
+            story.append(Paragraph(f"• {g}",S["Bullet"]))
+        story.append(Spacer(1,10))
+
+    if align.structural_recommendations:
+        story.append(Paragraph("STRUCTURAL RECOMMENDATIONS",S["SecHead"]))
+        story.append(HR(c=NAVY,t=1,b=0,a=6))
+        for rec in align.structural_recommendations:
+            story.append(Paragraph(f"• {rec}",S["Bullet"]))
+        story.append(Spacer(1,10))
+
+    # Chapter delivery scorecard
+    story.append(PageBreak())
+    story.append(Paragraph("CHAPTER DELIVERY SCORECARD",S["SecHead"]))
+    story.append(HR(c=NAVY,t=1,b=0,a=6))
+    story.append(Paragraph("Did each subsection deliver on its expected purpose? "
+        "High critical counts against a subsection = it did not.",S["Body"]))
+    story.append(Spacer(1,6))
+    td = [[Paragraph(f"<b>{h}</b>",S["TblH"]) for h in ["Chapter / Subsection","Expected Purpose","C/M/S"]]]
+    for cs in chs:
+        td.append([Paragraph(f"<b>Ch.{cs.chapter_num} — {cs.chapter_title[:50]}</b>",S["TblC"]),
+                   Paragraph("(see subsections)",S["TblCSm"]),
+                   Paragraph(f"{sum(1 for c in cs.comments if c.severity=='CRITICAL')} / "
+                              f"{sum(1 for c in cs.comments if c.severity=='MODERATE')} / "
+                              f"{sum(1 for c in cs.comments if c.severity=='SUGGESTION')}",S["TblC"])])
+        for sub in cs.subsections:
+            snc=sum(1 for c in sub.comments if c.severity=="CRITICAL")
+            snm=sum(1 for c in sub.comments if c.severity=="MODERATE")
+            sns=len(sub.comments)-snc-snm
+            td.append([Paragraph(f"   §{sub.subsection_num} {sub.title[:50]}",S["TblCSm"]),
+                       Paragraph(sub.expected_purpose[:120],S["TblCSm"]),
+                       Paragraph(f"{snc}/{snm}/{sns}",S["TblCSm"])])
+    cw = W-4*cm
+    t = Table(td,colWidths=[cw*.34,cw*.50,cw*.16])
+    t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),NAVY),("TEXTCOLOR",(0,0),(-1,0),WHITE),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,BOX_BG]),("BOX",(0,0),(-1,-1),.5,RULE),
+        ("INNERGRID",(0,0),(-1,-1),.3,RULE),("TOPPADDING",(0,0),(-1,-1),4),
+        ("BOTTOMPADDING",(0,0),(-1,-1),4),("VALIGN",(0,0),(-1,-1),"TOP")]))
+    story.append(t); story.append(Spacer(1,16)); story.append(HR())
+    story.append(Paragraph("ThesisSifu Pro v4.1 — Alignment Matrix. "
+        "Use alongside Report 1, 2, 3 to triangulate revision priorities.",S["Footer"]))
     doc.build(story); buf.seek(0); return buf.getvalue()
 
 
@@ -1639,66 +1649,69 @@ async def audit_document(file: UploadFile = File(...)):
         raise HTTPException(400, "Only PDF and DOCX files are supported.")
 
     audit_id = "SUP-" + hashlib.md5(content).hexdigest()[:10].upper()
+    print(f"[ThesisSifu] Starting audit {audit_id} for {filename}")
 
     # 1. Extract text
     full_text = extract_text(content, filename)
+    print(f"[ThesisSifu] Extracted {len(full_text)} chars from {filename}")
     if not full_text.strip():
-        full_text = "[Document appears image-based or empty]"
+        full_text = "[Document appears image-based or empty — text extraction returned nothing]"
 
-    # 2. Stage 0: spine extraction + Stage 1: classification (parallel)
-    spine_task = asyncio.create_task(extract_spine(full_text))
+    # 2. Stage 0+1: spine extraction + classification (parallel)
+    spine_task = asyncio.create_task(extract_spine(full_text, full_text))
     clf_task   = asyncio.create_task(classify_document(full_text))
     spine, clf = await asyncio.gather(spine_task, clf_task)
 
     doc_type = clf.get("type","MASTERS")
     field    = clf.get("field","UNKNOWN")
     inst     = clf.get("institution","UNKNOWN")
-    # If classifier got a title but spine didn't, fill it in
     if spine.title == "UNKNOWN" and clf.get("title","UNKNOWN") != "UNKNOWN":
         spine.title = clf["title"]
+    print(f"[ThesisSifu] doc_type={doc_type} title={spine.title[:60]}")
+    print(f"[ThesisSifu] Spine RQs: {spine.research_questions[:3]}")
 
     # 3. Split chapters + subsections
     chs = split_chapters(full_text)
     for cs in chs:
         cs.subsections = split_subsections(cs)
+    total_subs = sum(len(cs.subsections) for cs in chs)
+    print(f"[ThesisSifu] Split: {len(chs)} chapters, {total_subs} subsections")
 
-    # 4. Stage 2: subsection-level paragraph audit (parallel, max 6 concurrent)
-    sem = asyncio.Semaphore(6)
+    # 4. Stage 2: subsection paragraph audit (parallel, max 4 concurrent)
+    sem = asyncio.Semaphore(4)
     async def bounded(sub: Subsection, ch_title: str):
         async with sem:
-            return sub, await audit_subsection(sub, ch_title, doc_type, spine)
+            cmts = await audit_subsection(sub, ch_title, doc_type, spine, full_text)
+            return sub, cmts
 
-    tasks = []
-    for cs in chs:
-        for sub in cs.subsections:
-            tasks.append(bounded(sub, cs.chapter_title))
+    tasks   = [bounded(sub, cs.chapter_title) for cs in chs for sub in cs.subsections]
     results = await asyncio.gather(*tasks)
 
-    # Attach comments to subsections AND flatten to chapter level
     for sub, cmts in results:
         sub.comments = cmts
     for cs in chs:
         cs.comments = [c for sub in cs.subsections for c in sub.comments]
 
-    # 5. Stage 3: alignment audit (Claude)
+    total_comments = sum(len(cs.comments) for cs in chs)
+    print(f"[ThesisSifu] Total paragraph comments: {total_comments}")
+
+    # 5. Stage 3: alignment audit
     align = await run_alignment_audit(spine, chs)
 
-    # 6. Stage 4: holistic examiner synthesis
+    # 6. Stage 4: holistic examiner report
     examiner_text = await run_examiner(doc_type, spine, field, inst, chs, align)
 
-    # 7. Build four outputs
-    pdf1 = build_examiner_pdf(filename, audit_id, doc_type, clf, spine,
-                              examiner_text, align, chs)
+    # 7. Build outputs
+    pdf1    = build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, align, chs)
+    pdf3    = build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs)
+    pdf4    = build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs)
 
     if filename.lower().endswith(".pdf"):
-        output2 = build_annotated_pdf(content, filename, audit_id, chs)
+        output2   = build_annotated_pdf(content, full_text, audit_id, chs)
         out2_name = "2_Annotated_Thesis.pdf"
     else:
-        output2 = build_annotated_docx(content, filename, audit_id, chs, clf)
+        output2   = build_annotated_docx(content, filename, audit_id, chs, clf)
         out2_name = "2_Annotated_Thesis.docx"
-
-    pdf3 = build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs)
-    pdf4 = build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs)
 
     # 8. ZIP and return
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
@@ -1708,6 +1721,7 @@ async def audit_document(file: UploadFile = File(...)):
         zf.writestr("3_Commentary_Report.pdf", pdf3)
         zf.writestr("4_Alignment_Matrix_Report.pdf", pdf4)
     tmp.close()
+    print(f"[ThesisSifu] Audit {audit_id} complete. ZIP ready.")
 
     return FileResponse(
         path=tmp.name, media_type="application/zip",
@@ -1721,14 +1735,20 @@ async def audit_document(file: UploadFile = File(...)):
 async def health():
     return {
         "status":                "ok",
-        "classifier_available":  gemini_client is not None,
-        "audit_model_available": claude_client is not None,
-        "version":               "4.0.0",
-        "stages":                ["spine_extraction", "chapter_subsection_split",
-                                  "subsection_paragraph_audit", "alignment_audit",
-                                  "holistic_examiner"],
-        "outputs":               ["1_Examiner_Audit_Report.pdf",
-                                  "2_Annotated_Thesis.(docx|pdf)",
-                                  "3_Commentary_Report.pdf",
-                                  "4_Alignment_Matrix_Report.pdf"],
+        "gemini_available":      gemini_client is not None,
+        "gemini_model":          GEMINI_MODEL,
+        "claude_available":      claude_client is not None,
+        "version":               "4.1.0",
+        "fixes":                 [
+            "google.genai SDK (not deprecated google.generativeai)",
+            "robust chapter splitter (Roman numerals, word numbers, plain numbered headings)",
+            "subsection filter removed (was breaking on Roman numeral chapters)",
+            "safe Gemini response handler with finish_reason logging",
+            "page estimation uses full_text offset not subsection slice",
+            "prompt injection uses .replace() not .format() (no KeyError on curly braces)",
+            "annotated PDF uses wider search window + shorter fallback search",
+            "all exceptions logged with chapter+subsection context",
+        ],
+        "outputs": ["1_Examiner_Audit_Report.pdf","2_Annotated_Thesis.(docx|pdf)",
+                    "3_Commentary_Report.pdf","4_Alignment_Matrix_Report.pdf"],
     }
