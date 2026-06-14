@@ -86,7 +86,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 # ── AI Clients ─────────────────────────────────────────────────
 gemini_client = None
 claude_client = None
-GEMINI_MODEL  = "gemini-2.0-flash"   # flash (not flash-lite) for better JSON reliability
+GEMINI_MODEL  = "gemini-3.1-flash-lite"   # flash (not flash-lite) for better JSON reliability
 
 if GEMINI_AVAILABLE:
     gkey = os.environ.get("GEMINI_API_KEY")
