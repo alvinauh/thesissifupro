@@ -41,6 +41,7 @@ from dataclasses import dataclass, field as dc_field
 from typing import Optional
 
 import pypdf
+import pdfplumber
 import fitz  # PyMuPDF
 from docx import Document as DocxDocument
 from docx.oxml.ns import qn
@@ -310,14 +311,39 @@ def _gemini_text(response, context: str = "") -> str:
 
 # ── Text extraction ─────────────────────────────────────────────
 def extract_text(content: bytes, filename: str) -> str:
+    """Extract text from PDF or DOCX.
+    Uses pdfplumber for PDFs (preserves inter-word spaces that pypdf often drops),
+    with pypdf as fallback. Word-concatenation like '1Introduction' or '3ProblemStatement'
+    causes the chapter/subsection regex to produce hundreds of false positives,
+    which then starves the Gemini subsection auditor of real text."""
     fn = filename.lower()
     if fn.endswith(".pdf"):
-        reader = pypdf.PdfReader(io.BytesIO(content))
-        pages = []
-        for page in reader.pages:
-            t = page.extract_text() or ""
-            pages.append(t)
-        return "\n".join(pages)
+        # Primary: pdfplumber (layout-aware, preserves spaces)
+        try:
+            with pdfplumber.open(io.BytesIO(content)) as pdf:
+                pages = []
+                for page in pdf.pages:
+                    t = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
+                    pages.append(t)
+                text = "\n".join(pages)
+                if text.strip():
+                    print(f"[ThesisSifu] pdfplumber extracted {len(text)} chars")
+                    return text
+        except Exception as e:
+            print(f"[ThesisSifu] pdfplumber failed ({e}), falling back to pypdf")
+        # Fallback: pypdf
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(content))
+            pages = []
+            for page in reader.pages:
+                t = page.extract_text() or ""
+                pages.append(t)
+            text = "\n".join(pages)
+            print(f"[ThesisSifu] pypdf fallback extracted {len(text)} chars")
+            return text
+        except Exception as e:
+            print(f"[ThesisSifu] pypdf also failed: {e}")
+            return ""
     if fn.endswith(".docx"):
         doc = DocxDocument(io.BytesIO(content))
         return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
@@ -325,10 +351,9 @@ def extract_text(content: bytes, filename: str) -> str:
 
 
 # ── Chapter + Subsection splitter (robust) ────────────────────
-# Matches:
-#   "CHAPTER 1", "Chapter 1", "CHAPTER I", "CHAPTER ONE"
-#   "1.0 Title", "1. Title"  (numbered section heading)
-#   Allows title inline OR on the next line
+# Chapter pattern: ONLY matches "CHAPTER N" / "CHAPTER I" / "CHAPTER ONE"
+# and "N.0 Title" forms (explicit section-zero heading).
+# The old (\d+)[:\.\-] branch was matching statistics (3.432, 0.521) as chapters.
 _WORD_NUMS = {"one":"1","two":"2","three":"3","four":"4","five":"5",
               "six":"6","seven":"7","eight":"8","nine":"9","ten":"10"}
 _ROMAN = {"I":"1","II":"2","III":"3","IV":"4","V":"5",
@@ -337,17 +362,22 @@ _ROMAN = {"I":"1","II":"2","III":"3","IV":"4","V":"5",
 _CH_PAT = re.compile(
     r'(?:^|\n)'
     r'(?:'
-      r'(?:CHAPTER|BAHAGIAN|BAB)\s+(\d+|[IVX]+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN)'
-      r'|(\d+)(?:\.0+)?\s*[:\.\-—–]'   # "1.", "1.0", "1.0:"
+      # "CHAPTER 1", "CHAPTER I", "CHAPTER ONE", "BAB 1", "BAHAGIAN 2"
+      r'(?:CHAPTER|BAHAGIAN|BAB)\s+(\d{1,2}|[IVX]+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN)\b'
+      # "1.0 Introduction" or "2.0 Literature Review" — ONLY N.0 forms, not N.432
+      r'|(\d{1,2})\.0+\s'
     r')'
-    r'[:\s\-—–]*([^\n]{0,100})',          # optional inline title
+    r'[:\s\-—–]*([^\n]{0,100})',
     re.IGNORECASE,
 )
 
-# Subsection: "1.1", "1.2.3", "2.4" at line start
+# Subsection: "1.1 Title", "3.3.1 Title" — integers only, MUST be followed by space+letter.
+# Lookahead (?=[ \t]+[A-Za-z]) prevents matching statistics like 3.432, 0.521, 1.015.
 _SUB_PAT = re.compile(
-    r'(?:^|\n)[ \t]*(\d+\.\d+(?:\.\d+)?)'  # "1.1" or "1.2.3"
-    r'(?:[:\s\-—–]+([^\n]{0,120}))?',        # optional title
+    r'(?:^|\n)[ \t]*'
+    r'(\d{1,2}\.\d{1,3}(?:\.\d{1,3})?)'   # N.M or N.M.P (short integers, max 3 digits each)
+    r'(?=[ \t]+[A-Za-z])'                   # LOOKAHEAD: must be followed by whitespace then a letter
+    r'[ \t]+([^\n]{0,120})',                 # capture the title
 )
 
 _SUBSECTION_PURPOSE = {
@@ -428,10 +458,10 @@ def split_chapters(text: str) -> list[ChapterSummary]:
 
 def split_subsections(chapter: ChapterSummary) -> list[Subsection]:
     """Split a chapter into subsections.
-    FIX: No longer filters by chapter_num prefix (breaks on Roman numeral chapters).
-    Instead finds ANY 'N.M' pattern within the chapter text slice — the slice
-    already belongs to this chapter so false positives from other chapters
-    cannot appear."""
+    The _SUB_PAT lookahead (space+letter) already filters statistics,
+    but we also enforce a minimum text length so tiny fragments don't
+    consume Gemini quota returning empty results."""
+    MIN_SUB_CHARS = 300   # skip subsections shorter than this
     matches = list(_SUB_PAT.finditer(chapter.text))
     if not matches:
         return [Subsection(
@@ -446,12 +476,21 @@ def split_subsections(chapter: ChapterSummary) -> list[Subsection]:
         start     = m.start()
         end       = matches[i+1].start() if i+1 < len(matches) else len(chapter.text)
         sub_text  = chapter.text[start:end].strip()
+        if len(sub_text) < MIN_SUB_CHARS:
+            continue   # skip navigation entries, TOC lines, one-liner sections
         subs.append(Subsection(
             chapter_num=chapter.chapter_num, subsection_num=sub_num,
             title=sub_title, text=sub_text,
             char_offset=chapter.char_offset + start,
             expected_purpose=_purpose_for(sub_title),
         ))
+    # If all were too short, fall back to treating whole chapter as one subsection
+    if not subs:
+        return [Subsection(
+            chapter_num=chapter.chapter_num, subsection_num="—",
+            title=chapter.chapter_title, text=chapter.text,
+            char_offset=chapter.char_offset,
+            expected_purpose=_purpose_for(chapter.chapter_title))]
     return subs
 
 
