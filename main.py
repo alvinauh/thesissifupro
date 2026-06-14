@@ -323,7 +323,7 @@ def extract_text(content: bytes, filename: str) -> str:
             with pdfplumber.open(io.BytesIO(content)) as pdf:
                 pages = []
                 for page in pdf.pages:
-                    t = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
+                    t = page.extract_text(x_tolerance=1, y_tolerance=2) or ""
                     pages.append(t)
                 text = "\n".join(pages)
                 if text.strip():
@@ -511,6 +511,129 @@ def _estimate_page(full_text: str, excerpt: str, char_offset: int,
     return max(1, word_count // words_per_page + 1)
 
 
+def _find_content_start(text: str) -> int:
+    """Skip over preamble pages (cover, admin forms, acknowledgements, table of contents).
+    Returns the char position where substantive academic content begins.
+    Looks for the Abstract, then Chapter 1, then any 'Introduction' heading."""
+    markers = ["abstract\n", "Abstract\n", "ABSTRACT\n",
+               "CHAPTER 1\n", "Chapter 1\n", "CHAPTER ONE\n",
+               "1.1 Introduction\n", "1.1 Background\n",
+               "Introduction\n1.", "INTRODUCTION\n"]
+    best = len(text)
+    for marker in markers:
+        pos = text.find(marker)
+        if 0 < pos < best:
+            best = pos
+    # If nothing found in reasonable range, start at 0
+    return best if best < len(text) * 0.3 else 0
+
+def _extract_spine_fallback(text: str) -> dict:
+    """Rule-based spine extraction as fallback when Gemini fails.
+    Searches for explicit RQ/RO patterns, methodology keywords, etc."""
+    d = {
+        "title": "UNKNOWN", "discipline": "UNKNOWN",
+        "problem_statement": "NOT FOUND", "research_gap": "NOT FOUND",
+        "research_questions": [], "research_objectives": [], "hypotheses": [],
+        "theory_used": "NOT FOUND", "variables": [],
+        "methodology": "NOT FOUND", "sampling": "NOT FOUND",
+        "instrument": "NOT FOUND", "analysis_technique": "NOT FOUND",
+        "key_findings": [], "conclusions": []
+    }
+    # Title: look for ALL-CAPS line or explicit "Title:" field
+    title_m = re.search(r'(?:Tajuk|Title)\s*[:：]\s*([^\n]{10,120})', text, re.IGNORECASE)
+    if title_m: d["title"] = title_m.group(1).strip()
+    else:
+        # Try bold-looking ALL CAPS heading near top
+        caps_m = re.search(r'\n([A-Z][A-Z\s]{15,80})\n', text[:3000])
+        if caps_m: d["title"] = caps_m.group(1).strip()
+
+    # Research Questions: look for RQ1/RQ2 or "Research Question 1"
+    rq_matches = re.findall(
+        r'RQ\s*\d+\s*[:：]\s*([^\n?]+\??)', text, re.IGNORECASE)
+    if not rq_matches:
+        rq_matches = re.findall(
+            r'Research Question \d+\s*[:：]\s*([^\n?]+\??)', text, re.IGNORECASE)
+    d["research_questions"] = [r.strip() for r in rq_matches[:6]]
+
+    # Research Objectives: numbered "To verb..." lists
+    ro_matches = re.findall(
+        r'\d+\.\s+(To\s+(?:identify|examine|determine|explore|assess|investigate|describe|compare|evaluate|analyse|analyze)[^\n\.]{10,200})',
+        text, re.IGNORECASE)
+    d["research_objectives"] = [r.strip() for r in ro_matches[:6]]
+
+    # Hypotheses
+    h_matches = re.findall(r'H[01]\d*\s*[:：]\s*([^\n\.]{10,200})', text)
+    d["hypotheses"] = [h.strip() for h in h_matches[:6]]
+
+    # Methodology keywords
+    if re.search(r'mixed[\s-]method', text, re.IGNORECASE):
+        d["methodology"] = "Mixed-methods"
+        if re.search(r'explanatory sequential', text, re.IGNORECASE):
+            d["methodology"] = "Explanatory sequential mixed-methods"
+        elif re.search(r'convergent parallel', text, re.IGNORECASE):
+            d["methodology"] = "Convergent parallel mixed-methods"
+    elif re.search(r'\bqualitative\b', text, re.IGNORECASE) and not re.search(r'\bquantitative\b', text, re.IGNORECASE):
+        d["methodology"] = "Qualitative"
+    elif re.search(r'\bquantitative\b', text, re.IGNORECASE):
+        d["methodology"] = "Quantitative"
+
+    # Analysis technique
+    for technique in ["PLS-SEM", "CB-SEM", "thematic analysis", "Thematic Analysis",
+                       "Pearson correlation", "regression", "ANOVA", "IPA",
+                       "grounded theory", "Grounded Theory", "descriptive statistics"]:
+        if technique.lower() in text.lower():
+            existing = d["analysis_technique"]
+            if existing == "NOT FOUND":
+                d["analysis_technique"] = technique
+            elif technique.lower() not in existing.lower():
+                d["analysis_technique"] = existing + " + " + technique
+            break
+
+    # Theory
+    theory_patterns = [
+        ("Social Cognitive Theory", r"Social Cognitive Theory|Bandura.*self.efficacy"),
+        ("TAM", r"\bTAM\b|Technology Acceptance Model"),
+        ("UTAUT", r"\bUTAUT\b"),
+        ("TPB", r"Theory of Planned Behaviour|Theory of Planned Behavior"),
+        ("SDT", r"Self.Determination Theory"),
+    ]
+    for name, pat in theory_patterns:
+        if re.search(pat, text, re.IGNORECASE):
+            d["theory_used"] = name
+            break
+
+    # Sampling
+    samp_m = re.search(r'(n\s*=\s*\d+|sample\s+of\s+\d+|\d+\s+(?:respondents|participants|teachers|students))',
+                        text, re.IGNORECASE)
+    if samp_m: d["sampling"] = samp_m.group(0).strip()
+
+    # Abstract for problem + findings
+    abs_m = re.search(r'Abstract\s*\n(.{200,2000}?)(?:\n\n|\nKeywords|\nAbstrak)', text, re.IGNORECASE | re.DOTALL)
+    if abs_m:
+        abstract = abs_m.group(1).strip()
+        d["problem_statement"] = abstract[:400]
+        # Findings often in last sentence of abstract
+        sentences = [s.strip() for s in abstract.split('.') if len(s.strip()) > 30]
+        if sentences:
+            d["key_findings"] = [sentences[-1]] if sentences else []
+
+    # Discipline from keywords
+    for disc, pats in [
+        ("Education", ["teacher", "student", "classroom", "learning", "instruction", "pedagogy"]),
+        ("Information Systems", ["system", "technology", "adoption", "TAM", "IS"]),
+        ("Business", ["firm", "organization", "management", "strategy"]),
+        ("Health", ["patient", "health", "clinical", "medical"]),
+    ]:
+        if any(p.lower() in text[:5000].lower() for p in pats):
+            d["discipline"] = disc
+            break
+
+    print(f"[ThesisSifu] Fallback spine: RQs={len(d['research_questions'])}, "
+          f"ROs={len(d['research_objectives'])}, method={d['methodology']}, "
+          f"theory={d['theory_used']}")
+    return d
+
+
 # ── Stage 0: Spine Extraction ──────────────────────────────────
 _SPINE_PROMPT = """\
 You are extracting the STRUCTURAL SPINE of an academic thesis or article.
@@ -540,45 +663,70 @@ Document excerpt (front + back samples):
 """
 
 async def extract_spine(text: str, full_text: str) -> ThesisSpine:
-    if not gemini_client or not text.strip():
-        print("[ThesisSifu] Spine extraction skipped: no client or empty text")
-        return ThesisSpine()
-    front  = text[:6000]
-    back   = text[-4000:] if len(text) > 10000 else ""
-    sample = (front + "\n\n[...later in the document...]\n\n" + back)[:12000]
-    # Use .replace() instead of .format() to avoid KeyError on curly braces in text
+    # ── Smart sampling: skip preamble, start from Abstract/Chapter 1 ──────────
+    content_start = _find_content_start(text)
+    if content_start > 0:
+        print(f"[ThesisSifu] Skipping {content_start} chars of preamble for spine")
+    # Take front from content start, middle from RQ area, back from conclusions
+    content = text[content_start:]
+    front  = content[:6000]
+    # Try to find the RQ section specifically
+    rq_pos = text.find("RQ1:") or text.find("Research Question 1")
+    if rq_pos > 0:
+        middle = text[max(0, rq_pos-200):rq_pos+2000]
+    else:
+        middle = content[4000:8000] if len(content) > 8000 else ""
+    back   = text[-3000:] if len(text) > 15000 else ""
+    sample = (front + "\n\n[...RQ section...]\n\n" + middle +
+              "\n\n[...conclusion section...]\n\n" + back)[:14000]
     prompt = _SPINE_PROMPT.replace("EXCERPT_PLACEHOLDER", sample)
-    try:
-        r = await gemini_client.aio.models.generate_content(
-            model=GEMINI_MODEL, contents=prompt)
-        raw = _gemini_text(r, "spine_extraction")
-        if not raw:
-            return ThesisSpine()
-        raw = re.sub(r"```(?:json)?", "", raw).strip("`").strip()
-        d = json.loads(raw)
-        return ThesisSpine(
-            title=              d.get("title","UNKNOWN"),
-            discipline=         d.get("discipline","UNKNOWN"),
-            problem_statement=  d.get("problem_statement","NOT FOUND"),
-            research_gap=       d.get("research_gap","NOT FOUND"),
-            research_questions= d.get("research_questions",[]) or [],
-            research_objectives=d.get("research_objectives",[]) or [],
-            hypotheses=         d.get("hypotheses",[]) or [],
-            theory_used=        d.get("theory_used","NOT FOUND"),
-            variables=          d.get("variables",[]) or [],
-            methodology=        d.get("methodology","NOT FOUND"),
-            sampling=           d.get("sampling","NOT FOUND"),
-            instrument=         d.get("instrument","NOT FOUND"),
-            analysis_technique= d.get("analysis_technique","NOT FOUND"),
-            key_findings=       d.get("key_findings",[]) or [],
-            conclusions=        d.get("conclusions",[]) or [],
-        )
-    except json.JSONDecodeError as e:
-        print(f"[ThesisSifu] Spine JSON parse error: {e}")
-        return ThesisSpine()
-    except Exception as e:
-        print(f"[ThesisSifu] Spine extraction error: {e}\n{traceback.format_exc()}")
-        return ThesisSpine()
+
+    d = None
+    if gemini_client and text.strip():
+        try:
+            r = await gemini_client.aio.models.generate_content(
+                model=GEMINI_MODEL, contents=prompt)
+            raw = _gemini_text(r, "spine_extraction")
+            if raw:
+                raw = re.sub(r"```(?:json)?", "", raw).strip("`").strip()
+                d = json.loads(raw)
+                print(f"[ThesisSifu] Gemini spine: RQs={len(d.get('research_questions',[]))}")
+        except Exception as e:
+            print(f"[ThesisSifu] Spine Gemini error: {e}")
+
+    # ── Fallback: rule-based extraction if Gemini failed or returned mostly NOT FOUND ──
+    if d is None:
+        print("[ThesisSifu] Spine: using rule-based fallback (no Gemini result)")
+        d = _extract_spine_fallback(text)
+    else:
+        # Merge: fill in any NOT FOUND fields with rule-based results
+        fallback = _extract_spine_fallback(text)
+        for key in ["title", "problem_statement", "research_questions", "research_objectives",
+                    "hypotheses", "theory_used", "methodology", "analysis_technique",
+                    "sampling", "key_findings"]:
+            gemini_val = d.get(key)
+            fb_val = fallback.get(key)
+            if (not gemini_val or gemini_val in ("UNKNOWN","NOT FOUND",[])) and fb_val and fb_val not in ("UNKNOWN","NOT FOUND",[]):
+                d[key] = fb_val
+                print(f"[ThesisSifu] Spine fallback filled: {key}")
+
+    return ThesisSpine(
+        title=              d.get("title","UNKNOWN"),
+        discipline=         d.get("discipline","UNKNOWN"),
+        problem_statement=  d.get("problem_statement","NOT FOUND"),
+        research_gap=       d.get("research_gap","NOT FOUND"),
+        research_questions= d.get("research_questions",[]) or [],
+        research_objectives=d.get("research_objectives",[]) or [],
+        hypotheses=         d.get("hypotheses",[]) or [],
+        theory_used=        d.get("theory_used","NOT FOUND"),
+        variables=          d.get("variables",[]) or [],
+        methodology=        d.get("methodology","NOT FOUND"),
+        sampling=           d.get("sampling","NOT FOUND"),
+        instrument=         d.get("instrument","NOT FOUND"),
+        analysis_technique= d.get("analysis_technique","NOT FOUND"),
+        key_findings=       d.get("key_findings",[]) or [],
+        conclusions=        d.get("conclusions",[]) or [],
+    )
 
 
 # ── Stage 1: Classification ─────────────────────────────────────
@@ -1393,55 +1541,96 @@ def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
 
 # ── Output 2 (PDF): Annotated PDF (Sticky Notes) ─────────────
 def build_annotated_pdf(content: bytes, full_text: str, audit_id: str, chs: list) -> bytes:
+    """Place sticky-note annotations on the PDF.
+
+    PDF TEXT SEARCH LIMITATION: Many thesis PDFs use Identity-H CID TrueType fonts
+    which PyMuPDF cannot search with page.search_for(). Rather than placing all
+    annotations at (30,30) as invisible stacked fallbacks, we use a reliable
+    position-based strategy:
+      - Place each annotation in the RIGHT MARGIN of the estimated page
+      - Stagger vertically so multiple annotations on one page don't overlap
+      - Use a different Y offset for CRITICAL (top third), MODERATE (mid), SUGGESTION (bottom)
+      - Colour-code icon: red=CRITICAL, orange=MODERATE, blue=SUGGESTION
+    This guarantees every comment is visible and readable, regardless of font encoding.
+    """
     fitz_doc = fitz.open(stream=content, filetype="pdf")
     total_pages = len(fitz_doc)
-    annotated_count = 0
 
-    for cs in chs:
-        for c in cs.comments:
-            txt = _comment_text(c)
-            search_text = c.para_excerpt[:40].replace('\n',' ').strip()
-            if not search_text:
-                continue
+    # Track how many annotations are already on each page (to stagger Y)
+    page_annot_counts: dict[int, int] = {}
 
-            # Search a wider window around page estimate
-            pg_est = max(0, c.page_estimate - 1)
-            search_pages = list(range(
-                max(0, pg_est - 3),
-                min(total_pages, pg_est + 4)))
+    all_comments = [c for cs in chs for c in cs.comments]
+    print(f"[ThesisSifu] Placing {len(all_comments)} PDF annotations (position-based)")
 
-            placed = False
-            for p_num in search_pages:
-                page  = fitz_doc[p_num]
+    for c in all_comments:
+        txt = _comment_text(c)
+
+        # Determine target page (0-indexed, clamped)
+        pg = max(0, min(c.page_estimate - 1, total_pages - 1))
+
+        # Try text search first (works when fonts cooperate)
+        search_text = c.para_excerpt[:40].replace('\n', ' ').strip()
+        placed_by_search = False
+
+        if search_text:
+            search_range = range(max(0, pg - 2), min(total_pages, pg + 3))
+            for p_num in search_range:
+                page = fitz_doc[p_num]
                 rects = page.search_for(search_text)
-                if not rects:
-                    # Try shorter search
+                if not rects and len(search_text) > 20:
                     rects = page.search_for(search_text[:20])
                 if rects:
                     rect  = rects[0]
-                    point = fitz.Point(max(0, rect.x0 - 15), rect.y0)
+                    point = fitz.Point(max(5, rect.x0 - 18), rect.y0)
                     annot = page.add_text_annot(point, txt)
-                    annot.set_info(title="ThesisSifu Pro v4", content=txt)
-                    if   c.severity=="CRITICAL":   annot.set_colors(stroke=(0.8,0,0))
-                    elif c.severity=="MODERATE":   annot.set_colors(stroke=(0.9,0.4,0))
-                    else:                           annot.set_colors(stroke=(0,0,0.8))
+                    annot.set_info(title="ThesisSifu Pro", content=txt)
+                    if   c.severity == "CRITICAL":   annot.set_colors(stroke=(0.8, 0, 0))
+                    elif c.severity == "MODERATE":   annot.set_colors(stroke=(0.9, 0.4, 0))
+                    else:                             annot.set_colors(stroke=(0, 0, 0.8))
                     annot.update()
-                    placed = True
-                    annotated_count += 1
+                    placed_by_search = True
+                    page_annot_counts[p_num] = page_annot_counts.get(p_num, 0) + 1
                     break
 
-            if not placed:
-                # Fallback: place on estimated page, top margin
-                fb = min(pg_est, total_pages-1)
-                page  = fitz_doc[fb]
-                point = fitz.Point(30, 30)
-                annot = page.add_text_annot(point, f"[APPROX LOCATION]\n{txt}")
-                annot.set_colors(stroke=(0.5,0.5,0.5))
-                annot.update()
-                annotated_count += 1
+        if not placed_by_search:
+            # ── Position-based right-margin placement ──────────────────────
+            page = fitz_doc[pg]
+            pw   = page.rect.width
+            ph   = page.rect.height
 
-    print(f"[ThesisSifu] PDF annotations placed: {annotated_count}")
-    return fitz_doc.write()
+            # Base Y by severity: spread across page to avoid clustering
+            n = page_annot_counts.get(pg, 0)
+
+            # CRITICAL → top third, MODERATE → mid, SUGGESTION → bottom third
+            if c.severity == "CRITICAL":
+                base_y = ph * 0.10
+            elif c.severity == "MODERATE":
+                base_y = ph * 0.40
+            else:
+                base_y = ph * 0.70
+
+            # Stagger: each successive annotation on this page moves down 28pt
+            # Wrap back toward base if we'd go off page
+            y_pos = base_y + (n % 8) * 28
+            if y_pos > ph - 30:
+                y_pos = base_y + (n % 4) * 14
+
+            # X: right margin (5pt from edge)
+            x_pos = pw - 18
+
+            point = fitz.Point(x_pos, y_pos)
+            annot = page.add_text_annot(point, txt)
+            annot.set_info(title="ThesisSifu Pro", content=txt)
+            if   c.severity == "CRITICAL":   annot.set_colors(stroke=(0.8, 0, 0))
+            elif c.severity == "MODERATE":   annot.set_colors(stroke=(0.9, 0.4, 0))
+            else:                             annot.set_colors(stroke=(0, 0, 0.8))
+            annot.update()
+            page_annot_counts[pg] = page_annot_counts.get(pg, 0) + 1
+
+    total_placed = sum(page_annot_counts.values())
+    print(f"[ThesisSifu] PDF annotations placed: {total_placed} across "
+          f"{len(page_annot_counts)} pages")
+    return fitz_doc.tobytes()   # tobytes() is more reliable than write() for in-memory
 
 
 # ── Output 3: Commentary Report PDF ───────────────────────────
