@@ -9,3 +9,4 @@ reportlab
 Pillow
 google-genai>=0.8.0 
 anthropic
+pdfplumber>=0.11.0
