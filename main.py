@@ -761,56 +761,41 @@ async def classify_document(text: str) -> dict:
 
 
 # ── Stage 2: Subsection paragraph audit ───────────────────────
-# NOTE: Uses .replace() for CANONICAL blocks, .format() only for
-#       the simple non-curly-brace fields.
+# CANONICAL libraries removed from this prompt — they added ~4000 chars to every
+# one of 70+ parallel calls, blowing the total processing time past Railway's timeout.
+# Gemini still recommends frameworks/methods by name from its training knowledge.
 _SUBSECTION_PROMPT_TEMPLATE = """\
 You are a PhD supervisor auditing one SUBSECTION of a DOC_TYPE_PLACEHOLDER.
 
-THESIS SPINE (for alignment checking — cite these in every comment):
-  Title:            TITLE_PLACEHOLDER
-  Problem:          PROBLEM_PLACEHOLDER
-  Research Qs:      RQS_PLACEHOLDER
-  Research Objs:    ROS_PLACEHOLDER
-  Theory used:      THEORY_PLACEHOLDER
-  Methodology:      METHOD_PLACEHOLDER
-  Analysis:         ANALYSIS_PLACEHOLDER
-  Variables:        VARS_PLACEHOLDER
+THESIS SPINE (cite these in every comment):
+  Title:      TITLE_PLACEHOLDER
+  Problem:    PROBLEM_PLACEHOLDER
+  RQs:        RQS_PLACEHOLDER
+  ROs:        ROS_PLACEHOLDER
+  Theory:     THEORY_PLACEHOLDER
+  Method:     METHOD_PLACEHOLDER
+  Analysis:   ANALYSIS_PLACEHOLDER
 
 CHAPTER CHNUM_PLACEHOLDER — CHTITLE_PLACEHOLDER
 SUBSECTION SUBNUM_PLACEHOLDER — SUBTITLE_PLACEHOLDER
-Expected purpose of this subsection: PURPOSE_PLACEHOLDER
+Expected purpose: PURPOSE_PLACEHOLDER
 
-YOUR TASK
-For 4-8 paragraphs needing attention in this subsection, return a JSON array.
-Each element must have these EXACT keys:
-[
-  {
-    "para_excerpt": "first 80 chars of the paragraph verbatim",
-    "severity": "CRITICAL",
-    "issue": "specific intellectual problem",
-    "recommendation": "specific fix tied to thesis spine",
-    "literature_needed": "type of evidence needed (do NOT invent paper titles)",
-    "theory_needed": "named framework OR none",
-    "suggested_framework": "EXACT name + author from canonical list, e.g. TAM (Davis 1989), or empty string",
-    "suggested_method": "EXACT name + author from canonical list, e.g. PLS-SEM (Hair et al. 2017), or empty string"
-  }
-]
+For 3-6 paragraphs needing attention, return a JSON array. Each element:
+{
+  "para_excerpt": "first 80 chars verbatim",
+  "severity": "CRITICAL|MODERATE|SUGGESTION",
+  "issue": "specific intellectual problem referencing the spine above",
+  "recommendation": "specific fix",
+  "literature_needed": "type of evidence needed (no invented titles)",
+  "theory_needed": "named framework or none",
+  "suggested_framework": "e.g. TAM (Davis 1989) or empty string",
+  "suggested_method": "e.g. PLS-SEM (Hair et al. 2017) or empty string"
+}
 
-ALIGNMENT — flag CRITICAL when:
-  - Paragraph contradicts the problem statement or strays from RQs/ROs
-  - Subsection does not deliver its expected purpose
-  - Methodology cannot answer the stated RQ
-  - Finding does not map to any RQ
-  - Conclusion overreaches what the analysis supports
-  - Theory invoked but not operationalised
+Flag CRITICAL when: paragraph contradicts RQs/ROs, subsection misses its purpose,
+method cannot answer the RQ, finding doesn't map to any RQ, conclusion overreaches.
 
-CANONICAL FRAMEWORKS:
-FRAMEWORKS_PLACEHOLDER
-
-CANONICAL METHODS:
-METHODS_PLACEHOLDER
-
-Return ONLY the JSON array. No markdown fences. No prose before or after.
+Return ONLY the JSON array. No markdown fences.
 
 Subsection text:
 \"\"\"TEXT_PLACEHOLDER\"\"\"\
@@ -820,26 +805,22 @@ async def audit_subsection(sub: Subsection, ch_title: str, doc_type: str,
                             spine: ThesisSpine, full_text: str) -> list[ParagraphComment]:
     if not gemini_client or not sub.text.strip():
         return []
-    # Build prompt using .replace() to avoid KeyError on braces in canonical text or user text
     prompt = (
         _SUBSECTION_PROMPT_TEMPLATE
         .replace("DOC_TYPE_PLACEHOLDER", doc_type)
-        .replace("TITLE_PLACEHOLDER",    spine.title[:200])
-        .replace("PROBLEM_PLACEHOLDER",  spine.problem_statement[:300])
-        .replace("RQS_PLACEHOLDER",      "; ".join(spine.research_questions[:5]) or "NOT FOUND")
-        .replace("ROS_PLACEHOLDER",      "; ".join(spine.research_objectives[:5]) or "NOT FOUND")
-        .replace("THEORY_PLACEHOLDER",   spine.theory_used)
-        .replace("METHOD_PLACEHOLDER",   spine.methodology)
-        .replace("ANALYSIS_PLACEHOLDER", spine.analysis_technique)
-        .replace("VARS_PLACEHOLDER",     "; ".join(spine.variables[:8]) or "NOT FOUND")
+        .replace("TITLE_PLACEHOLDER",    spine.title[:150])
+        .replace("PROBLEM_PLACEHOLDER",  spine.problem_statement[:200])
+        .replace("RQS_PLACEHOLDER",      "; ".join(spine.research_questions[:4]) or "NOT FOUND")
+        .replace("ROS_PLACEHOLDER",      "; ".join(spine.research_objectives[:4]) or "NOT FOUND")
+        .replace("THEORY_PLACEHOLDER",   spine.theory_used[:100])
+        .replace("METHOD_PLACEHOLDER",   spine.methodology[:100])
+        .replace("ANALYSIS_PLACEHOLDER", spine.analysis_technique[:100])
         .replace("CHNUM_PLACEHOLDER",    sub.chapter_num)
-        .replace("CHTITLE_PLACEHOLDER",  ch_title[:80])
+        .replace("CHTITLE_PLACEHOLDER",  ch_title[:60])
         .replace("SUBNUM_PLACEHOLDER",   sub.subsection_num)
-        .replace("SUBTITLE_PLACEHOLDER", sub.title[:80])
-        .replace("PURPOSE_PLACEHOLDER",  sub.expected_purpose[:200])
-        .replace("FRAMEWORKS_PLACEHOLDER", CANONICAL_FRAMEWORKS)
-        .replace("METHODS_PLACEHOLDER",    CANONICAL_METHODS)
-        .replace("TEXT_PLACEHOLDER",       sub.text[:7000])
+        .replace("SUBTITLE_PLACEHOLDER", sub.title[:60])
+        .replace("PURPOSE_PLACEHOLDER",  sub.expected_purpose[:150])
+        .replace("TEXT_PLACEHOLDER",     sub.text[:4000])   # reduced from 7000
     )
     ctx = f"ch{sub.chapter_num}.{sub.subsection_num}"
     try:
@@ -1944,8 +1925,8 @@ async def audit_document(file: UploadFile = File(...)):
     total_subs = sum(len(cs.subsections) for cs in chs)
     print(f"[ThesisSifu] Split: {len(chs)} chapters, {total_subs} subsections")
 
-    # 4. Stage 2: subsection paragraph audit (parallel, max 4 concurrent)
-    sem = asyncio.Semaphore(4)
+    # 4. Stage 2: subsection paragraph audit (parallel, max 10 concurrent)
+    sem = asyncio.Semaphore(10)
     async def bounded(sub: Subsection, ch_title: str):
         async with sem:
             cmts = await audit_subsection(sub, ch_title, doc_type, spine, full_text)
