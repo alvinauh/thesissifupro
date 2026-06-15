@@ -35,10 +35,10 @@ Returns:   application/zip
 
 from __future__ import annotations
 
-import io, os, re, json, asyncio, zipfile, hashlib, tempfile, traceback
+import io, os, re, json, asyncio, zipfile, hashlib, tempfile, traceback, base64
 from datetime import datetime
 from dataclasses import dataclass, field as dc_field
-from typing import Optional
+from typing import Optional, AsyncGenerator
 
 import pypdf
 import pdfplumber
@@ -50,7 +50,7 @@ from docx.opc.part import XmlPart
 from docx.opc.packuri import PackURI
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
 
@@ -1903,7 +1903,7 @@ _AUDIT_LOCK: Optional[asyncio.Semaphore] = None
 def _get_audit_lock() -> asyncio.Semaphore:
     global _AUDIT_LOCK
     if _AUDIT_LOCK is None:
-        _AUDIT_LOCK = asyncio.Semaphore(1)
+        _AUDIT_LOCK = asyncio.Semaphore(2)  # Level 2: 2 concurrent audits (requires 2GB RAM on Railway)
     return _AUDIT_LOCK
 
 # ── Main endpoint ──────────────────────────────────────────────
@@ -2018,7 +2018,214 @@ async def _run_audit(content: bytes, filename: str, audit_id: str):
     )
 
 
-@app.get("/health")
+# ── In-memory result store ─────────────────────────────────────
+# Stores completed ZIP bytes keyed by audit_id for ~5 minutes
+# so the browser can download after SSE stream ends.
+_RESULTS: dict[str, bytes] = {}
+_RESULT_LOCK = None  # lazy init like _AUDIT_LOCK
+
+def _get_result_lock():
+    global _RESULT_LOCK
+    if _RESULT_LOCK is None:
+        _RESULT_LOCK = asyncio.Lock()
+    return _RESULT_LOCK
+
+
+def _sse(event: str, data: dict) -> str:
+    """Format a Server-Sent Event string."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.post("/audit/stream")
+async def audit_stream(file: UploadFile = File(...)):
+    """SSE streaming audit endpoint.
+    Returns a text/event-stream with progress events, then a 'done' event
+    containing the audit_id. The client then fetches /audit/download/{audit_id}
+    to get the ZIP.
+
+    Events emitted:
+      progress  { stage: str, message: str, pct: int }
+      error     { message: str }
+      done      { audit_id: str, filename: str }
+    """
+    content  = await file.read()
+    filename = file.filename or "document"
+
+    if not filename.lower().endswith((".pdf", ".docx")):
+        async def _err():
+            yield _sse("error", {"message": "Only PDF and DOCX files are supported."})
+        return StreamingResponse(_err(), media_type="text/event-stream")
+
+    audit_id = "SUP-" + hashlib.md5(content).hexdigest()[:10].upper()
+
+    async def _stream() -> AsyncGenerator[str, None]:
+        import gc
+        try:
+            yield _sse("progress", {"stage": "extract", "message": "Extracting text from document...", "pct": 5})
+
+            full_text = extract_text(content, filename)
+            if not full_text.strip():
+                full_text = "[Document appears image-based or empty]"
+            yield _sse("progress", {"stage": "extract", "message": f"Extracted {len(full_text):,} characters", "pct": 10})
+
+            yield _sse("progress", {"stage": "spine", "message": "Extracting thesis spine (RQs, methodology, theory)...", "pct": 15})
+            spine_task = asyncio.create_task(extract_spine(full_text, full_text))
+            clf_task   = asyncio.create_task(classify_document(full_text))
+            spine, clf = await asyncio.gather(spine_task, clf_task)
+
+            doc_type = clf.get("type", "MASTERS")
+            field    = clf.get("field", "UNKNOWN")
+            inst     = clf.get("institution", "UNKNOWN")
+            if spine.title == "UNKNOWN" and clf.get("title", "UNKNOWN") != "UNKNOWN":
+                spine.title = clf["title"]
+            rq_count = len(spine.research_questions)
+            yield _sse("progress", {
+                "stage": "spine",
+                "message": f"Spine extracted — {rq_count} RQs found, theory: {spine.theory_used[:40]}",
+                "pct": 20
+            })
+
+            yield _sse("progress", {"stage": "split", "message": "Splitting chapters and subsections...", "pct": 22})
+            chs = split_chapters(full_text)
+            for cs in chs:
+                cs.subsections = split_subsections(cs)
+            total_subs = sum(len(cs.subsections) for cs in chs)
+            yield _sse("progress", {
+                "stage": "split",
+                "message": f"Found {len(chs)} chapters, {total_subs} subsections",
+                "pct": 25
+            })
+
+            yield _sse("progress", {"stage": "audit", "message": f"Auditing {total_subs} subsections in parallel...", "pct": 28})
+
+            # Run subsection audit with progress updates per chapter
+            sem = asyncio.Semaphore(10)
+            completed = {"n": 0}
+
+            async def bounded_with_progress(sub, ch_title):
+                async with sem:
+                    cmts = await audit_subsection(sub, ch_title, doc_type, spine, full_text)
+                    completed["n"] += 1
+                    return sub, cmts
+
+            tasks = [bounded_with_progress(sub, cs.chapter_title)
+                     for cs in chs for sub in cs.subsections]
+
+            # Gather with periodic progress yields
+            results = []
+            batch_size = max(1, len(tasks) // 5)
+            for i in range(0, len(tasks), batch_size):
+                batch = tasks[i:i + batch_size]
+                batch_results = await asyncio.gather(*batch)
+                results.extend(batch_results)
+                pct = 28 + int((len(results) / len(tasks)) * 40)
+                yield _sse("progress", {
+                    "stage": "audit",
+                    "message": f"Audited {len(results)}/{len(tasks)} subsections...",
+                    "pct": pct
+                })
+
+            for sub, cmts in results:
+                sub.comments = cmts
+            for cs in chs:
+                cs.comments = [c for sub in cs.subsections for c in sub.comments]
+
+            total_comments = sum(len(cs.comments) for cs in chs)
+            del tasks, results
+            gc.collect()
+            yield _sse("progress", {
+                "stage": "audit",
+                "message": f"Paragraph audit complete — {total_comments} comments generated",
+                "pct": 68
+            })
+
+            yield _sse("progress", {"stage": "analysis", "message": "Running alignment audit and examiner report...", "pct": 70})
+            align, examiner_text = await asyncio.gather(
+                run_alignment_audit(spine, chs),
+                run_examiner(doc_type, spine, field, inst, chs, AlignmentMatrix())
+            )
+            yield _sse("progress", {
+                "stage": "analysis",
+                "message": f"Analysis complete — golden thread: {align.golden_thread_score}",
+                "pct": 82
+            })
+            gc.collect()
+
+            yield _sse("progress", {"stage": "pdf", "message": "Building PDF reports...", "pct": 85})
+            pdf1 = build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, align, chs)
+            pdf3 = build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs)
+            pdf4 = build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs)
+
+            if filename.lower().endswith(".pdf"):
+                output2   = build_annotated_pdf(content, full_text, audit_id, chs)
+                out2_name = "2_Annotated_Thesis.pdf"
+            else:
+                output2   = build_annotated_docx(content, filename, audit_id, chs, clf)
+                out2_name = "2_Annotated_Thesis.docx"
+
+            del content, full_text, chs, examiner_text, spine, align
+            gc.collect()
+
+            yield _sse("progress", {"stage": "zip", "message": "Packaging ZIP...", "pct": 93})
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("1_Examiner_Audit_Report.pdf", pdf1)
+                zf.writestr(out2_name, output2)
+                zf.writestr("3_Commentary_Report.pdf", pdf3)
+                zf.writestr("4_Alignment_Matrix_Report.pdf", pdf4)
+            zip_bytes = buf.getvalue()
+
+            # Store result for download
+            async with _get_result_lock():
+                _RESULTS[audit_id] = zip_bytes
+
+            # Schedule cleanup after 10 minutes
+            async def _cleanup():
+                await asyncio.sleep(600)
+                async with _get_result_lock():
+                    _RESULTS.pop(audit_id, None)
+            asyncio.create_task(_cleanup())
+
+            yield _sse("progress", {"stage": "done", "message": "Audit complete!", "pct": 100})
+            yield _sse("done", {
+                "audit_id": audit_id,
+                "filename": f"ThesisSifu_v4_Audit_{audit_id}.zip",
+                "comments": total_comments,
+            })
+
+        except Exception as e:
+            print(f"[ThesisSifu] Stream error: {e}\n{traceback.format_exc()}")
+            yield _sse("error", {"message": f"Audit failed: {str(e)[:200]}"})
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",       # disable Nginx/Railway buffering
+            "Access-Control-Allow-Origin": "*",
+        }
+    )
+
+
+@app.get("/audit/download/{audit_id}")
+async def audit_download(audit_id: str):
+    """Download the ZIP for a completed audit by audit_id."""
+    async with _get_result_lock():
+        zip_bytes = _RESULTS.get(audit_id)
+    if not zip_bytes:
+        raise HTTPException(404, "Audit result not found or expired (results kept for 10 minutes).")
+    return StreamingResponse(
+        io.BytesIO(zip_bytes),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="ThesisSifu_v4_Audit_{audit_id}.zip"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        }
+    )
+
+
+
 async def health():
     return {
         "status":                "ok",
