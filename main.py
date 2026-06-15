@@ -1745,8 +1745,10 @@ def build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs) -> bytes
                         ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
                         ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
                         ("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+                    # Sanitize excerpt — may contain quotes, ampersands, angle brackets
+                    safe_excerpt = c.para_excerpt[:120].replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
                     excerpt_box = Table(
-                        [[Paragraph(f'<i>"{c.para_excerpt[:120]}..."</i>',S["Excerpt"])]],
+                        [[_safe_para(f'<i>"{safe_excerpt}..."</i>',S["Excerpt"])]],
                         colWidths=[W-5*cm])
                     excerpt_box.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),LGRAY),
                         ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
@@ -1754,7 +1756,7 @@ def build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs) -> bytes
                     fw_line = f'<br/><br/><b>Suggested framework:</b> {c.suggested_framework}' if c.suggested_framework else ""
                     mt_line = f'<br/><br/><b>Suggested method/reference:</b> {c.suggested_method}' if c.suggested_method else ""
                     detail_box = Table(
-                        [[Paragraph(
+                        [[_safe_para(
                             f'<b>Issue:</b> {c.issue}<br/><br/>'
                             f'<b>Recommendation:</b> {c.recommendation}<br/><br/>'
                             f'<b>Literature needed:</b> {c.literature_needed}<br/><br/>'
@@ -1801,7 +1803,7 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
 
     story.append(Paragraph("OVERALL ALIGNMENT VERDICT",S["SecHead"]))
     story.append(HR(c=NAVY,t=1,b=0,a=6))
-    story.append(Paragraph(align.overall_verdict or "(no verdict generated)",S["Body"]))
+    story.append(_safe_para(align.overall_verdict or "(no verdict generated)",S["Body"]))
     story.append(Spacer(1,8))
 
     story.append(Paragraph("THESIS SPINE (for reference)",S["SecHead"]))
@@ -1813,7 +1815,7 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
     story.append(HR(c=NAVY,t=1,b=0,a=6))
 
     if not align.rows:
-        story.append(Paragraph("<i>No alignment rows produced. "
+        story.append(_safe_para("<i>No alignment rows produced. "
             "This usually means the spine extraction could not identify Research Questions. "
             "Check that the document has clear RQ/RO statements and the GEMINI_API_KEY is valid.</i>",S["Body"]))
     else:
@@ -1823,11 +1825,11 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
             sc = ALIGN_COLORS.get(r.status,ACCENT)
             roh = r.ro + (f" / {r.hypothesis}" if r.hypothesis and r.hypothesis!="—" else "")
             td.append([
-                Paragraph(r.rq[:100],S["TblCSm"]),
-                Paragraph(roh[:90],S["TblCSm"]),
-                Paragraph(f"{r.method[:60]}\n{r.analysis[:60]}",S["TblCSm"]),
-                Paragraph(r.finding[:90],S["TblCSm"]),
-                Paragraph(r.conclusion[:90],S["TblCSm"]),
+                _safe_para(r.rq[:100],S["TblCSm"]),
+                _safe_para(roh[:90],S["TblCSm"]),
+                _safe_para(f"{r.method[:60]}\n{r.analysis[:60]}",S["TblCSm"]),
+                _safe_para(r.finding[:90],S["TblCSm"]),
+                _safe_para(r.conclusion[:90],S["TblCSm"]),
                 Paragraph(f'<font color="{sc.hexval()}"><b>{r.status}</b></font>',S["TblCSm"]),
             ])
         cw = W-4*cm
@@ -1848,12 +1850,12 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
             badge = Table([[Paragraph(r.status,S["Badge"])]],colWidths=[3*cm])
             badge.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),sc),
                 ("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3)]))
-            hrow = Table([[Paragraph(f"<b>RQ{i}.</b> {r.rq[:140]}",S["Body"]),badge]],
+            hrow = Table([[_safe_para(f"<b>RQ{i}.</b> {r.rq[:140]}",S["Body"]),badge]],
                           colWidths=[W-5*cm-3.2*cm,3*cm])
             hrow.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"),
                 ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0)]))
             story.append(hrow)
-            if r.note: story.append(Paragraph(f"<i>{r.note}</i>",S["Excerpt"]))
+            if r.note: story.append(_safe_para(f"<i>{r.note}</i>",S["Excerpt"]))
             story.append(Spacer(1,6))
 
     if align.critical_gaps:
@@ -1861,14 +1863,14 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
         story.append(Paragraph("CRITICAL STRUCTURAL GAPS",S["SecHead"]))
         story.append(HR(c=NAVY,t=1,b=0,a=6))
         for g in align.critical_gaps:
-            story.append(Paragraph(f"• {g}",S["Bullet"]))
+            story.append(_safe_para(f"• {g}",S["Bullet"]))
         story.append(Spacer(1,10))
 
     if align.structural_recommendations:
         story.append(Paragraph("STRUCTURAL RECOMMENDATIONS",S["SecHead"]))
         story.append(HR(c=NAVY,t=1,b=0,a=6))
         for rec in align.structural_recommendations:
-            story.append(Paragraph(f"• {rec}",S["Bullet"]))
+            story.append(_safe_para(f"• {rec}",S["Bullet"]))
         story.append(Spacer(1,10))
 
     # Chapter delivery scorecard
@@ -1880,7 +1882,7 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
     story.append(Spacer(1,6))
     td = [[Paragraph(f"<b>{h}</b>",S["TblH"]) for h in ["Chapter / Subsection","Expected Purpose","C/M/S"]]]
     for cs in chs:
-        td.append([Paragraph(f"<b>Ch.{cs.chapter_num} — {cs.chapter_title[:50]}</b>",S["TblC"]),
+        td.append([_safe_para(f"<b>Ch.{cs.chapter_num} — {cs.chapter_title[:50]}</b>",S["TblC"]),
                    Paragraph("(see subsections)",S["TblCSm"]),
                    Paragraph(f"{sum(1 for c in cs.comments if c.severity=='CRITICAL')} / "
                               f"{sum(1 for c in cs.comments if c.severity=='MODERATE')} / "
@@ -1889,8 +1891,8 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
             snc=sum(1 for c in sub.comments if c.severity=="CRITICAL")
             snm=sum(1 for c in sub.comments if c.severity=="MODERATE")
             sns=len(sub.comments)-snc-snm
-            td.append([Paragraph(f"   §{sub.subsection_num} {sub.title[:50]}",S["TblCSm"]),
-                       Paragraph(sub.expected_purpose[:120],S["TblCSm"]),
+            td.append([_safe_para(f"   §{sub.subsection_num} {sub.title[:50]}",S["TblCSm"]),
+                       _safe_para(sub.expected_purpose[:120],S["TblCSm"]),
                        Paragraph(f"{snc}/{snm}/{sns}",S["TblCSm"])])
     cw = W-4*cm
     t = Table(td,colWidths=[cw*.34,cw*.50,cw*.16])
