@@ -955,7 +955,7 @@ async def run_alignment_audit(spine: ThesisSpine, chs: list[ChapterSummary]) -> 
     )
     try:
         msg = await claude_client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=4096, temperature=0.2,
+            model="claude-haiku-4-5", max_tokens=2048, temperature=0.2,
             system=_ALIGNMENT_SYSTEM,
             messages=[{"role":"user","content":prompt}])
         raw = msg.content[0].text.strip()
@@ -1179,42 +1179,48 @@ async def run_examiner(doc_type: str, spine: ThesisSpine, field: str, inst: str,
                        chs: list[ChapterSummary], align: AlignmentMatrix) -> str:
     if not claude_client:
         return "Examiner synthesis unavailable — ANTHROPIC_API_KEY not set."
-    # Build summaries
+    # Build compact summaries — only critical issues per chapter, capped tightly
     summaries = ""
     for cs in chs:
         n_c = sum(1 for c in cs.comments if c.severity=="CRITICAL")
         n_m = sum(1 for c in cs.comments if c.severity=="MODERATE")
+        if not cs.comments:
+            continue
         summaries += (f"\nCh.{cs.chapter_num} — {cs.chapter_title}: "
-                      f"{len(cs.comments)} comments (Critical:{n_c} Moderate:{n_m})\n")
+                      f"{len(cs.comments)} comments (C:{n_c} M:{n_m})\n")
         for sub in cs.subsections:
             crit = [c for c in sub.comments if c.severity=="CRITICAL"]
             if crit:
-                summaries += f"  §{sub.subsection_num} {sub.title} [purpose: {sub.expected_purpose[:70]}]\n"
-                for c in crit[:3]:
-                    summaries += f"    [CRITICAL] {c.issue}\n"
-    gaps = "\n".join(f"  * {g}" for g in align.critical_gaps[:8]) or "  (none)"
+                summaries += f"  §{sub.subsection_num} {sub.title[:50]}\n"
+                for c in crit[:2]:   # max 2 critical per subsection
+                    summaries += f"    • {c.issue[:120]}\n"
+    summaries = summaries[:4000]   # hard cap down from 8000
+
+    gaps = "\n".join(f"  * {g[:120]}" for g in align.critical_gaps[:5]) or "  (none)"
     template = _EXAMINER_TEMPLATES.get(doc_type, _MASTERS_EXAMINER)
     prompt = (
         template
-        .replace("TITLE_PLACEHOLDER",        spine.title[:200])
+        .replace("TITLE_PLACEHOLDER",        spine.title[:150])
         .replace("FIELD_PLACEHOLDER",         field)
         .replace("INST_PLACEHOLDER",          inst)
-        .replace("PROBLEM_PLACEHOLDER",       spine.problem_statement[:400])
-        .replace("RQS_PLACEHOLDER",           "; ".join(spine.research_questions[:5]) or "NOT FOUND")
-        .replace("ROS_PLACEHOLDER",           "; ".join(spine.research_objectives[:5]) or "NOT FOUND")
-        .replace("THEORY_PLACEHOLDER",        spine.theory_used)
-        .replace("METHOD_PLACEHOLDER",        spine.methodology)
-        .replace("ANALYSIS_PLACEHOLDER",      spine.analysis_technique)
+        .replace("PROBLEM_PLACEHOLDER",       spine.problem_statement[:300])
+        .replace("RQS_PLACEHOLDER",           "; ".join(spine.research_questions[:4]) or "NOT FOUND")
+        .replace("ROS_PLACEHOLDER",           "; ".join(spine.research_objectives[:4]) or "NOT FOUND")
+        .replace("THEORY_PLACEHOLDER",        spine.theory_used[:100])
+        .replace("METHOD_PLACEHOLDER",        spine.methodology[:100])
+        .replace("ANALYSIS_PLACEHOLDER",      spine.analysis_technique[:100])
         .replace("GT_SCORE_PLACEHOLDER",      align.golden_thread_score)
-        .replace("ALIGN_VERDICT_PLACEHOLDER", align.overall_verdict)
+        .replace("ALIGN_VERDICT_PLACEHOLDER", align.overall_verdict[:300])
         .replace("GAPS_PLACEHOLDER",          gaps)
-        .replace("SUMMARIES_PLACEHOLDER",     summaries[:8000])
+        .replace("SUMMARIES_PLACEHOLDER",     summaries)
         .replace("FRAMEWORKS_PLACEHOLDER",    CANONICAL_FRAMEWORKS)
         .replace("METHODS_PLACEHOLDER",       CANONICAL_METHODS)
     )
     try:
         msg = await claude_client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=8192, temperature=0.3,
+            model="claude-haiku-4-5",   # 3-5x faster than Sonnet; still excellent for structured reports
+            max_tokens=4096,            # reduced from 8192 — enough for a complete report
+            temperature=0.3,
             system=_EXAMINER_SYSTEM,
             messages=[{"role":"user","content":prompt}])
         return msg.content[0].text.strip()
@@ -1943,13 +1949,18 @@ async def audit_document(file: UploadFile = File(...)):
     total_comments = sum(len(cs.comments) for cs in chs)
     print(f"[ThesisSifu] Total paragraph comments: {total_comments}")
 
-    # 5. Stage 3: alignment audit
-    align = await run_alignment_audit(spine, chs)
+    # 5+6. Alignment audit + examiner report in PARALLEL — saves ~15-20 seconds
+    # The examiner prompt uses spine + chapter summaries (already available).
+    # The alignment matrix is a separate PDF; the examiner banner gets the real
+    # align object when build_examiner_pdf runs below.
+    print(f"[ThesisSifu] Running alignment + examiner in parallel...")
+    align, examiner_text = await asyncio.gather(
+        run_alignment_audit(spine, chs),
+        run_examiner(doc_type, spine, field, inst, chs, AlignmentMatrix())
+    )
+    print(f"[ThesisSifu] Alignment score={align.golden_thread_score}")
 
-    # 6. Stage 4: holistic examiner report
-    examiner_text = await run_examiner(doc_type, spine, field, inst, chs, align)
-
-    # 7. Build outputs
+    # 7. Build outputs (PDF builds are CPU-bound, run sequentially)
     pdf1    = build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, align, chs)
     pdf3    = build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs)
     pdf4    = build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs)
