@@ -1893,6 +1893,12 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
     doc.build(story); buf.seek(0); return buf.getvalue()
 
 
+# ── Global audit lock ──────────────────────────────────────────
+# One audit at a time on this Railway instance — prevents two concurrent
+# pdfplumber+fitz+Gemini pipelines from doubling memory usage and causing OOM kill.
+# If a second request arrives while one is running, it waits up to 600 seconds.
+_AUDIT_LOCK = asyncio.Semaphore(1)
+
 # ── Main endpoint ──────────────────────────────────────────────
 @app.post("/audit")
 async def audit_document(file: UploadFile = File(...)):
@@ -1904,6 +1910,14 @@ async def audit_document(file: UploadFile = File(...)):
 
     audit_id = "SUP-" + hashlib.md5(content).hexdigest()[:10].upper()
     print(f"[ThesisSifu] Starting audit {audit_id} for {filename}")
+
+    async with _AUDIT_LOCK:
+        return await _run_audit(content, filename, audit_id)
+
+
+async def _run_audit(content: bytes, filename: str, audit_id: str):
+    """Core audit pipeline — runs under the global lock."""
+    import gc
 
     # 1. Extract text
     full_text = extract_text(content, filename)
@@ -1946,21 +1960,23 @@ async def audit_document(file: UploadFile = File(...)):
     for cs in chs:
         cs.comments = [c for sub in cs.subsections for c in sub.comments]
 
+    # Free task list memory before next stage
+    del tasks, results
+    gc.collect()
+
     total_comments = sum(len(cs.comments) for cs in chs)
     print(f"[ThesisSifu] Total paragraph comments: {total_comments}")
 
-    # 5+6. Alignment audit + examiner report in PARALLEL — saves ~15-20 seconds
-    # The examiner prompt uses spine + chapter summaries (already available).
-    # The alignment matrix is a separate PDF; the examiner banner gets the real
-    # align object when build_examiner_pdf runs below.
+    # 5+6. Alignment audit + examiner report in PARALLEL
     print(f"[ThesisSifu] Running alignment + examiner in parallel...")
     align, examiner_text = await asyncio.gather(
         run_alignment_audit(spine, chs),
         run_examiner(doc_type, spine, field, inst, chs, AlignmentMatrix())
     )
     print(f"[ThesisSifu] Alignment score={align.golden_thread_score}")
+    gc.collect()
 
-    # 7. Build outputs (PDF builds are CPU-bound, run sequentially)
+    # 7. Build outputs — free content bytes after annotated PDF is built
     pdf1    = build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, align, chs)
     pdf3    = build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs)
     pdf4    = build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs)
@@ -1971,6 +1987,11 @@ async def audit_document(file: UploadFile = File(...)):
     else:
         output2   = build_annotated_docx(content, filename, audit_id, chs, clf)
         out2_name = "2_Annotated_Thesis.docx"
+
+    # Free the large objects before building ZIP
+    del content, full_text, chs, examiner_text, spine, align
+    gc.collect()
+    print(f"[ThesisSifu] Memory freed, building ZIP...")
 
     # 8. ZIP and return
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
