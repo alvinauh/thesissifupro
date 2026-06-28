@@ -779,6 +779,7 @@ THESIS SPINE (cite these in every comment):
 CHAPTER CHNUM_PLACEHOLDER — CHTITLE_PLACEHOLDER
 SUBSECTION SUBNUM_PLACEHOLDER — SUBTITLE_PLACEHOLDER
 Expected purpose: PURPOSE_PLACEHOLDER
+CURRENT YEAR: YEAR_PLACEHOLDER (Do not flag 2024, 2025, or 2026 citations as "future" or "unpublished").
 
 For 3-6 paragraphs needing attention, return a JSON array. Each element:
 {
@@ -820,7 +821,8 @@ async def audit_subsection(sub: Subsection, ch_title: str, doc_type: str,
         .replace("SUBNUM_PLACEHOLDER",   sub.subsection_num)
         .replace("SUBTITLE_PLACEHOLDER", sub.title[:60])
         .replace("PURPOSE_PLACEHOLDER",  sub.expected_purpose[:150])
-        .replace("TEXT_PLACEHOLDER",     sub.text[:4000])   # reduced from 7000
+        .replace("FRAMEWORKS_PLACEHOLDER",    CANONICAL_FRAMEWORKS)
+        .replace("METHODS_PLACEHOLDER",       CANONICAL_METHODS)
     )
     ctx = f"ch{sub.chapter_num}.{sub.subsection_num}"
     try:
@@ -1477,7 +1479,7 @@ def build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, 
                        Paragraph(str(snc),S["TblCSm"]),Paragraph(str(snm),S["TblCSm"]),
                        Paragraph(str(sns),S["TblCSm"]),Paragraph(str(snc+snm+sns),S["TblCSm"])])
     cw = W-5*cm
-    t = Table(td,colWidths=[cw*.52,cw*.12,cw*.12,cw*.12,cw*.12])
+    t = Table(td,colWidths=[cw*.52,cw*.12,cw*.12,cw*.12,cw*.12], repeatRows=1)
     t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),NAVY),("TEXTCOLOR",(0,0),(-1,0),WHITE),
         ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,BOX_BG]),("BOX",(0,0),(-1,-1),.5,RULE),
         ("INNERGRID",(0,0),(-1,-1),.3,RULE),("TOPPADDING",(0,0),(-1,-1),4),
@@ -1695,7 +1697,7 @@ def build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs) -> bytes
           [Paragraph("SUGGESTION",S["TblC"]),Paragraph(str(ns),S["TblC"]),
            Paragraph("Improvement opportunities",S["TblC"])],
           [Paragraph("TOTAL",S["TblC"]),Paragraph(str(len(all_c)),S["TblC"]),Paragraph("",S["TblC"])]]
-    t = Table(td,colWidths=[cw*.22,cw*.12,cw*.66])
+    t = Table(td,colWidths=[cw*.22,cw*.12,cw*.66], repeatRows=1)
     t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),NAVY),("TEXTCOLOR",(0,0),(-1,0),WHITE),
         ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,BOX_BG]),("BOX",(0,0),(-1,-1),.5,RULE),
         ("INNERGRID",(0,0),(-1,-1),.3,RULE),("TOPPADDING",(0,0),(-1,-1),5),
@@ -1820,7 +1822,7 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
                 Paragraph(f'<font color="{sc.hexval()}"><b>{r.status}</b></font>',S["TblCSm"]),
             ])
         cw = W-4*cm
-        t = Table(td,colWidths=[cw*.18,cw*.15,cw*.20,cw*.17,cw*.17,cw*.13])
+        t = Table(td,colWidths=[cw*.18,cw*.15,cw*.20,cw*.17,cw*.17,cw*.13], repeatRows=1)
         t.setStyle(TableStyle([
             ("BACKGROUND",(0,0),(-1,0),NAVY),("TEXTCOLOR",(0,0),(-1,0),WHITE),
             ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,BOX_BG]),
@@ -1882,7 +1884,7 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
                        _safe_para(sub.expected_purpose[:120],S["TblCSm"]),
                        Paragraph(f"{snc}/{snm}/{sns}",S["TblCSm"])])
     cw = W-4*cm
-    t = Table(td,colWidths=[cw*.34,cw*.50,cw*.16])
+    t = Table(td,colWidths=[cw*.34,cw*.50,cw*.16], repeatRows=1)
     t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),NAVY),("TEXTCOLOR",(0,0),(-1,0),WHITE),
         ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,BOX_BG]),("BOX",(0,0),(-1,-1),.5,RULE),
         ("INNERGRID",(0,0),(-1,-1),.3,RULE),("TOPPADDING",(0,0),(-1,-1),4),
