@@ -421,6 +421,11 @@ def _purpose_for(title: str) -> str:
             return v
     return "Auditor should infer purpose from chapter context."
 
+import textwrap
+
+def _shorten(s: str, width: int) -> str:
+    return textwrap.shorten(s or "", width=width, placeholder="…")
+
 def _normalise_chnum(raw: str) -> str:
     """Convert Roman/word chapter numbers to Arabic integers."""
     r = raw.strip().upper()
@@ -437,24 +442,38 @@ def split_chapters(text: str) -> list[ChapterSummary]:
                                text=text[s:s+size],
                                char_offset=s)
                 for i, s in enumerate(range(0, len(text), size))]
-    chapters = []
+
+    # Build candidate spans first, THEN dedupe — keep the largest span per
+    # chapter number. A real chapter body is always much longer than a
+    # one-line Table-of-Contents entry, so this drops ToC noise matches
+    # and the garbled "title bleeds into next heading" problem they cause.
+    candidates = []
     for i, m in enumerate(matches):
         raw_num = (m.group(1) or m.group(2) or str(i+1))
         num     = _normalise_chnum(raw_num)
         title   = (m.group(3) or "").strip() or f"Chapter {num}"
-        # If title is empty the heading might continue on the next line
-        if not title.strip():
+        # Stop the title at the first sign it has bled into a numbered
+        # subsection heading (e.g. "LITERATURE REVIEW 2.1 Introduction")
+        title = re.split(r'\s+\d{1,2}\.\d', title)[0].strip()
+        if not title:
             next_nl = text.find("\n", m.end())
-            if next_nl != -1:
-                title = text[m.end():next_nl].strip() or f"Chapter {num}"
-        start   = m.start()
-        end     = matches[i+1].start() if i+1 < len(matches) else len(text)
-        ch_text = text[start:end].strip()
+            title = text[m.end():next_nl].strip() if next_nl != -1 else f"Chapter {num}"
+        start = m.start()
+        end   = matches[i+1].start() if i+1 < len(matches) else len(text)
+        candidates.append((num, title, start, end))
+
+    best = {}
+    for num, title, start, end in candidates:
+        span = end - start
+        if num not in best or span > (best[num][3] - best[num][2]):
+            best[num] = (num, title, start, end)
+
+    chapters = []
+    for num, title, start, end in sorted(best.values(), key=lambda x: x[2]):
         chapters.append(ChapterSummary(
             chapter_num=num, chapter_title=title,
-            text=ch_text, char_offset=start))
+            text=text[start:end].strip(), char_offset=start))
     return chapters or [ChapterSummary("1", "Full Document", text, 0)]
-
 
 def split_subsections(chapter: ChapterSummary) -> list[Subsection]:
     """Split a chapter into subsections.
@@ -1467,7 +1486,7 @@ def build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, 
         nc2=sum(1 for c in cs.comments if c.severity=="CRITICAL")
         nm2=sum(1 for c in cs.comments if c.severity=="MODERATE")
         ns2=len(cs.comments)-nc2-nm2
-        td.append([Paragraph(f"<b>Ch.{cs.chapter_num} — {cs.chapter_title[:40]}</b>",S["TblC"]),
+        td.append([Paragraph(f"<b>Ch.{cs.chapter_num} — {_shorten(cs.chapter_title, 40)}</b>",S["TblC"]),
                    Paragraph(str(nc2),S["TblC"]),Paragraph(str(nm2),S["TblC"]),
                    Paragraph(str(ns2),S["TblC"]),Paragraph(str(nc2+nm2+ns2),S["TblC"])])
         for sub in cs.subsections:
@@ -1475,7 +1494,7 @@ def build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, 
             snc=sum(1 for c in sub.comments if c.severity=="CRITICAL")
             snm=sum(1 for c in sub.comments if c.severity=="MODERATE")
             sns=len(sub.comments)-snc-snm
-            td.append([Paragraph(f"   §{sub.subsection_num} {sub.title[:45]}",S["TblCSm"]),
+            td.append([Paragraph(f"   §{sub.subsection_num} {_shorten(sub.title, 45)}",S["TblCSm"]),
                        Paragraph(str(snc),S["TblCSm"]),Paragraph(str(snm),S["TblCSm"]),
                        Paragraph(str(sns),S["TblCSm"]),Paragraph(str(snc+snm+sns),S["TblCSm"])])
     cw = W-5*cm
@@ -1869,22 +1888,28 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
     story.append(Paragraph("Did each subsection deliver on its expected purpose? "
         "High critical counts against a subsection = it did not.",S["Body"]))
     story.append(Spacer(1,6))
-    td = [[Paragraph(f"<b>{h}</b>",S["TblH"]) for h in ["Chapter / Subsection","Expected Purpose","C/M/S"]]]
+    td = [[Paragraph(f"<b>{h}</b>",S["TblH"]) for h in
+           ["Chapter / Subsection","Expected Purpose","Crit","Mod","Sugg"]]]
     for cs in chs:
-        td.append([_safe_para(f"<b>Ch.{cs.chapter_num} — {cs.chapter_title[:50]}</b>",S["TblC"]),
+        nc2=sum(1 for c in cs.comments if c.severity=="CRITICAL")
+        nm2=sum(1 for c in cs.comments if c.severity=="MODERATE")
+        ns2=sum(1 for c in cs.comments if c.severity=="SUGGESTION")
+        td.append([_safe_para(f"<b>Ch.{cs.chapter_num} — {_shorten(cs.chapter_title, 50)}</b>",S["TblC"]),
                    Paragraph("(see subsections)",S["TblCSm"]),
-                   Paragraph(f"{sum(1 for c in cs.comments if c.severity=='CRITICAL')} / "
-                              f"{sum(1 for c in cs.comments if c.severity=='MODERATE')} / "
-                              f"{sum(1 for c in cs.comments if c.severity=='SUGGESTION')}",S["TblC"])])
+                   Paragraph(f'<font color="{RED.hexval()}">{nc2}</font>' if nc2 else "0",S["TblC"]),
+                   Paragraph(f'<font color="{AMBER.hexval()}">{nm2}</font>' if nm2 else "0",S["TblC"]),
+                   Paragraph(str(ns2),S["TblC"])])
         for sub in cs.subsections:
             snc=sum(1 for c in sub.comments if c.severity=="CRITICAL")
             snm=sum(1 for c in sub.comments if c.severity=="MODERATE")
             sns=len(sub.comments)-snc-snm
-            td.append([_safe_para(f"   §{sub.subsection_num} {sub.title[:50]}",S["TblCSm"]),
+            td.append([_safe_para(f"   §{sub.subsection_num} {_shorten(sub.title, 50)}",S["TblCSm"]),
                        _safe_para(sub.expected_purpose[:120],S["TblCSm"]),
-                       Paragraph(f"{snc}/{snm}/{sns}",S["TblCSm"])])
+                       Paragraph(f'<font color="{RED.hexval()}">{snc}</font>' if snc else "0",S["TblCSm"]),
+                       Paragraph(f'<font color="{AMBER.hexval()}">{snm}</font>' if snm else "0",S["TblCSm"]),
+                       Paragraph(str(sns),S["TblCSm"])])
     cw = W-4*cm
-    t = Table(td,colWidths=[cw*.34,cw*.50,cw*.16], repeatRows=1)
+    t = Table(td, colWidths=[cw*.32, cw*.42, cw*.08, cw*.08, cw*.08], repeatRows=1)
     t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),NAVY),("TEXTCOLOR",(0,0),(-1,0),WHITE),
         ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,BOX_BG]),("BOX",(0,0),(-1,-1),.5,RULE),
         ("INNERGRID",(0,0),(-1,-1),.3,RULE),("TOPPADDING",(0,0),(-1,-1),4),
