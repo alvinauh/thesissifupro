@@ -15,6 +15,13 @@ FIXES in v4.1:
     to prevent KeyError on any curly braces in canonical text
   - Annotated PDF: bumped search window and added full-text fallback search
   - All exceptions logged with chapter+subsection context for Railway log debugging
+  - v4.1.1: ThesisSpine fields are now coerced to their declared types (str/list)
+    when built from Gemini's JSON. Gemini's output isn't schema-enforced, so a
+    field documented as a string (e.g. "instrument") can come back as a JSON
+    array, which used to crash every downstream .replace() call on that field
+    with "TypeError: replace() argument 2 must be str, not list". Fixed by
+    normalising every field once, at construction time, instead of trusting
+    the JSON shape at every call site.
 
 Pipeline:
   Stage 0  Spine Extraction        (Gemini)   → ThesisSpine
@@ -307,6 +314,41 @@ def _gemini_text(response, context: str = "") -> str:
     except Exception as e:
         print(f"[ThesisSifu] _gemini_text error ({context}): {e}")
         return ""
+
+
+# ── Spine field type-coercion helpers ───────────────────────────
+# Gemini's JSON output is NOT schema-enforced. A field the prompt describes
+# as a plain string (e.g. "instrument": "questionnaire / interview protocol")
+# can legally come back as a JSON array, dict, or number instead. If that
+# value is assigned straight into a `str`-typed ThesisSpine field, every
+# downstream `.replace(PLACEHOLDER, spine.some_field)` call in
+# run_alignment_audit / run_examiner / audit_subsection crashes with
+# "TypeError: replace() argument 2 must be str, not list" — as happened in
+# production. Coercing once here, at construction time, is cheaper and safer
+# than guarding every call site individually.
+def _flatten_to_str(v, sep: str = "; ") -> str:
+    """Coerce any Gemini JSON value into plain text for a str-typed spine field."""
+    if v is None:
+        return ""
+    if isinstance(v, (list, tuple, set)):
+        return sep.join(_flatten_to_str(x, sep) for x in v)
+    if isinstance(v, dict):
+        return sep.join(f"{k}: {_flatten_to_str(val, sep)}" for k, val in v.items())
+    return str(v)
+
+def _flatten_to_list(v) -> list:
+    """Coerce any Gemini JSON value into a list for a list-typed spine field.
+    Guards the mirror-image failure mode: if Gemini returns a bare string where
+    a list was expected, code like '; '.join(spine.research_questions) would
+    silently join individual characters instead of crashing — a quieter but
+    still-wrong outcome that this normalises away."""
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    if isinstance(v, (tuple, set)):
+        return list(v)
+    return [str(v)]
 
 
 # ── Text extraction ─────────────────────────────────────────────
@@ -729,22 +771,29 @@ async def extract_spine(text: str, full_text: str) -> ThesisSpine:
                 d[key] = fb_val
                 print(f"[ThesisSifu] Spine fallback filled: {key}")
 
+    # ── Coerce every field to its declared type before constructing the dataclass ──
+    # Gemini's JSON isn't schema-enforced: a field documented as a string can come
+    # back as a list/dict/number, and a field documented as a list can come back
+    # as a bare string. Either mismatch used to propagate silently (or crash later
+    # in .replace()/.join() calls deep in run_alignment_audit/run_examiner). Both
+    # helpers are idempotent, so this is safe regardless of whether `d` came from
+    # Gemini or the rule-based fallback above.
     return ThesisSpine(
-        title=              d.get("title","UNKNOWN"),
-        discipline=         d.get("discipline","UNKNOWN"),
-        problem_statement=  d.get("problem_statement","NOT FOUND"),
-        research_gap=       d.get("research_gap","NOT FOUND"),
-        research_questions= d.get("research_questions",[]) or [],
-        research_objectives=d.get("research_objectives",[]) or [],
-        hypotheses=         d.get("hypotheses",[]) or [],
-        theory_used=        d.get("theory_used","NOT FOUND"),
-        variables=          d.get("variables",[]) or [],
-        methodology=        d.get("methodology","NOT FOUND"),
-        sampling=           d.get("sampling","NOT FOUND"),
-        instrument=         d.get("instrument","NOT FOUND"),
-        analysis_technique= d.get("analysis_technique","NOT FOUND"),
-        key_findings=       d.get("key_findings",[]) or [],
-        conclusions=        d.get("conclusions",[]) or [],
+        title=              _flatten_to_str(d.get("title","UNKNOWN")),
+        discipline=         _flatten_to_str(d.get("discipline","UNKNOWN")),
+        problem_statement=  _flatten_to_str(d.get("problem_statement","NOT FOUND")),
+        research_gap=       _flatten_to_str(d.get("research_gap","NOT FOUND")),
+        research_questions= _flatten_to_list(d.get("research_questions",[])),
+        research_objectives=_flatten_to_list(d.get("research_objectives",[])),
+        hypotheses=         _flatten_to_list(d.get("hypotheses",[])),
+        theory_used=        _flatten_to_str(d.get("theory_used","NOT FOUND")),
+        variables=          _flatten_to_list(d.get("variables",[])),
+        methodology=        _flatten_to_str(d.get("methodology","NOT FOUND")),
+        sampling=           _flatten_to_str(d.get("sampling","NOT FOUND")),
+        instrument=         _flatten_to_str(d.get("instrument","NOT FOUND")),
+        analysis_technique= _flatten_to_str(d.get("analysis_technique","NOT FOUND")),
+        key_findings=       _flatten_to_list(d.get("key_findings",[])),
+        conclusions=        _flatten_to_list(d.get("conclusions",[])),
     )
 
 
@@ -2259,7 +2308,7 @@ async def health():
         "gemini_available":      gemini_client is not None,
         "gemini_model":          GEMINI_MODEL,
         "claude_available":      claude_client is not None,
-        "version":               "4.1.0",
+        "version":               "4.1.1",
         "fixes":                 [
             "google.genai SDK (not deprecated google.generativeai)",
             "robust chapter splitter (Roman numerals, word numbers, plain numbered headings)",
@@ -2269,6 +2318,9 @@ async def health():
             "prompt injection uses .replace() not .format() (no KeyError on curly braces)",
             "annotated PDF uses wider search window + shorter fallback search",
             "all exceptions logged with chapter+subsection context",
+            "ThesisSpine fields coerced to declared str/list types at construction "
+            "(fixes 'TypeError: replace() argument 2 must be str, not list' when "
+            "Gemini returns an array for a documented-as-string field)",
         ],
         "outputs": ["1_Examiner_Audit_Report.pdf","2_Annotated_Thesis.(docx|pdf)",
                     "3_Commentary_Report.pdf","4_Alignment_Matrix_Report.pdf"],
