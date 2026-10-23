@@ -23,12 +23,30 @@ FIXES in v4.1:
     normalising every field once, at construction time, instead of trusting
     the JSON shape at every call site.
 
+CHANGES in v4.2:
+  - Language detection: the thesis BODY (abstracts and reference list excluded)
+    decides English vs Bahasa Melayu; every stage and every report label then
+    uses that language. BM headings (BAB, Persoalan/Objektif Kajian, Kerangka
+    Teori, ...) are recognised by the splitter, purpose map and spine fallback.
+  - Golden thread: each chapter is digested in full (Gemini) into what it
+    commits to (RQs, constructs, measures, analyses, findings, contributions)
+    with verbatim evidence. The alignment audit reads all digests, so it can
+    trace a construct/RQ from Chapter 1 through to the conclusion.
+  - The examiner now runs AFTER the alignment audit and receives its results
+    (it previously ran in parallel and was handed an empty matrix).
+  - Supporting literature: serious issues are matched to REAL published works
+    retrieved from OpenAlex (OPENALEX_API_KEY) or Crossref; the model may only
+    pick from retrieved records, so references cannot be invented.
+  - Alignment + examiner use Claude Sonnet 5 with structured JSON output.
+  - SSE keep-alives during long stages; /health route restored.
+
 Pipeline:
-  Stage 0  Spine Extraction        (Gemini)   → ThesisSpine
+  Stage 0  Language detection      (rules)    → en | ms
   Stage 1  Chapter + Subsection Split (regex) → structural map
-  Stage 2  Subsection paragraph audit (Gemini, parallel, max 4 concurrent)
-  Stage 3  Alignment Audit         (Claude)   → AlignmentMatrix
-  Stage 4  Holistic Examiner Report (Claude)  → uses spine + matrix
+  Stage 2  Spine + Classification + Chapter digests (Gemini, parallel)
+  Stage 3  Subsection paragraph audit (Gemini, parallel)
+  Stage 4  Alignment Audit (Claude) ∥ Literature grounding (OpenAlex/Crossref + Gemini)
+  Stage 5  Holistic Examiner Report (Claude)  → uses spine + matrix + literature
 
 Outputs (ZIP):
   1_Examiner_Audit_Report.pdf     — holistic critique, references spine
@@ -43,6 +61,7 @@ Returns:   application/zip
 from __future__ import annotations
 
 import io, os, re, json, asyncio, zipfile, hashlib, tempfile, traceback, base64
+import urllib.request, urllib.parse
 from datetime import datetime
 from dataclasses import dataclass, field as dc_field
 from typing import Optional, AsyncGenerator
@@ -85,7 +104,7 @@ except ImportError:
 
 
 # ── App ────────────────────────────────────────────────────────
-app = FastAPI(title="ThesisSifu Pro v4.1 — Alignment-Aware", version="4.1.0")
+app = FastAPI(title="ThesisSifu Pro v4.2 — Alignment-Aware", version="4.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -94,6 +113,15 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 gemini_client = None
 claude_client = None
 GEMINI_MODEL  = "gemini-2.5-flash"   # current stable model as of June 2026
+CLAUDE_MODEL  = "claude-sonnet-5"    # alignment + examiner (cross-chapter reasoning)
+CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "high")
+
+# Literature grounding. OpenAlex is used when OPENALEX_API_KEY is set (free key =
+# $1/day ≈ 1,000 searches); otherwise Crossref (free, no key). LITERATURE_MAILTO
+# puts Crossref requests in its faster "polite" pool.
+OPENALEX_API_KEY  = os.environ.get("OPENALEX_API_KEY", "")
+LITERATURE_MAILTO = os.environ.get("LITERATURE_MAILTO", "")
+MAX_LIT_COMMENTS  = int(os.environ.get("MAX_LIT_COMMENTS", 24))
 
 if GEMINI_AVAILABLE:
     gkey = os.environ.get("GEMINI_API_KEY")
@@ -107,7 +135,7 @@ if ANTHROPIC_AVAILABLE:
     akey = os.environ.get("ANTHROPIC_API_KEY")
     if akey:
         claude_client = anthropic.AsyncAnthropic(api_key=akey)
-        print("[ThesisSifu] Claude Sonnet 4.6 ready")
+        print(f"[ThesisSifu] Claude {CLAUDE_MODEL} ready")
     else:
         print("[ThesisSifu] WARNING: ANTHROPIC_API_KEY not set")
 
@@ -255,6 +283,9 @@ class ParagraphComment:
     theory_needed:       str
     suggested_framework: str = ""
     suggested_method:    str = ""
+    golden_thread_link:  str = ""      # which cross-chapter link this issue affects
+    search_query:        str = ""      # keywords used to retrieve supporting literature
+    references:          list = dc_field(default_factory=list)  # verified works, see attach_literature
 
 @dataclass
 class Subsection:
@@ -274,18 +305,25 @@ class ChapterSummary:
     char_offset:   int = 0             # offset within full_text for page estimation
     subsections:   list = dc_field(default_factory=list)
     comments:      list = dc_field(default_factory=list)
+    digest:        dict = dc_field(default_factory=dict)   # what this chapter commits to
 
 @dataclass
 class AlignmentRow:
-    rq:         str = "—"
-    ro:         str = "—"
-    hypothesis: str = "—"
-    method:     str = "—"
-    analysis:   str = "—"
-    finding:    str = "—"
-    conclusion: str = "—"
-    status:     str = "UNCLEAR"
-    note:       str = ""
+    rq:               str = "—"
+    ro:               str = "—"
+    hypothesis:       str = "—"
+    theory_construct: str = "—"
+    method:           str = "—"
+    instrument:       str = "—"
+    analysis:         str = "—"
+    finding:          str = "—"
+    discussion:       str = "—"
+    conclusion:       str = "—"
+    status:           str = "UNCLEAR"
+    broken_link:      str = ""
+    evidence:         str = ""
+    note:             str = ""
+    fix:              str = ""
 
 @dataclass
 class AlignmentMatrix:
@@ -294,6 +332,8 @@ class AlignmentMatrix:
     golden_thread_score:        str = "UNCLEAR"
     critical_gaps:              list = dc_field(default_factory=list)
     structural_recommendations: list = dc_field(default_factory=list)
+    chapter_links:              list = dc_field(default_factory=list)  # dicts: from_chapter, to_chapter, link, status, evidence, fix
+    construct_consistency:      list = dc_field(default_factory=list)  # dicts: construct, trace, status, note
 
 
 # ── Gemini response helper ─────────────────────────────────────
@@ -351,6 +391,145 @@ def _flatten_to_list(v) -> list:
     return [str(v)]
 
 
+def _parse_json_loose(raw: str):
+    """Parse model JSON output, tolerating markdown fences."""
+    raw = re.sub(r"```(?:json)?", "", raw or "").strip("`").strip()
+    return json.loads(raw)
+
+
+async def _gemini_json(prompt: str, context: str):
+    """One Gemini call in JSON mode. Returns parsed JSON, or None on any failure."""
+    if not gemini_client:
+        return None
+    raw = ""
+    try:
+        r = await gemini_client.aio.models.generate_content(
+            model=GEMINI_MODEL, contents=prompt,
+            config={"response_mime_type": "application/json"})
+        raw = _gemini_text(r, context)
+        if not raw:
+            return None
+        return _parse_json_loose(raw)
+    except json.JSONDecodeError as e:
+        print(f"[ThesisSifu] JSON parse error in {context}: {e}\nRaw: {raw[:300]}")
+    except Exception as e:
+        print(f"[ThesisSifu] Gemini error in {context}: {e}")
+    return None
+
+
+# ── Language detection ─────────────────────────────────────────
+# Malaysian theses usually carry BOTH an English Abstract and a BM Abstrak, and
+# the reference list is mostly English even in a BM thesis. Counting function
+# words over the whole file therefore misjudges the language, so the abstracts
+# and the reference list are removed first and only the body is counted.
+_BM_WORDS = frozenset(
+    "yang dan dengan untuk dalam ini itu kepada adalah oleh bagi tidak pada akan "
+    "telah dapat daripada iaitu serta juga atau secara terhadap boleh lebih "
+    "kajian antara mereka sebagai".split())
+_EN_WORDS = frozenset(
+    "the and of to in is that for with this are was be by which as on from not "
+    "were their these have has been an it can between".split())
+
+_ABSTRACT_HEAD = re.compile(r'^[ \t]*(?:ABSTRACT|ABSTRAK)\b', re.IGNORECASE | re.MULTILINE)
+_ABSTRACT_END = re.compile(
+    r'^[ \t]*(?:ABSTRACT|ABSTRAK|ACKNOWLEDGE?MENTS?|PENGHARGAAN|TABLE OF CONTENTS|'
+    r'CONTENTS|KANDUNGAN|ISI KANDUNGAN|LIST OF TABLES|SENARAI JADUAL|DECLARATION|'
+    r'PENGAKUAN|DEDICATION|DEDIKASI|CHAPTER\s+\S+|BAB\s+\S+)\b',
+    re.IGNORECASE | re.MULTILINE)
+_REFS_HEAD = re.compile(r'^[ \t]*(?:REFERENCES|RUJUKAN|BIBLIOGRAPHY|BIBLIOGRAFI)[ \t]*$',
+                        re.IGNORECASE | re.MULTILINE)
+# "Smith, J. (2020). ..." / "[12] Smith, J., ..." / "Ahmad Zaki, M. (2019)."
+_REF_ENTRY = re.compile(r'^\s*(?:\[\d+\]\s*)?[A-Z][\w\'\-]+(?:\s[A-Z][\w\'\-]+)*,\s+[A-Z]\.[^\n]*\(?\d{4}')
+
+def _strip_abstracts(text: str) -> str:
+    out, pos = [], 0
+    for m in _ABSTRACT_HEAD.finditer(text):
+        if m.start() < pos:
+            continue
+        out.append(text[pos:m.start()])
+        nxt = _ABSTRACT_END.search(text, m.end())
+        # An abstract is at most a page or two; never drop more than ~8k chars.
+        pos = nxt.start() if nxt and nxt.start() - m.end() < 8000 else min(len(text), m.end() + 4000)
+    out.append(text[pos:])
+    return "".join(out)
+
+def detect_language(full_text: str) -> dict:
+    """Decide the thesis language from its body (abstracts + references excluded)."""
+    body = _strip_abstracts(full_text)
+    # Cut the reference list + appendices at the last REFERENCES/RUJUKAN heading,
+    # unless that would discard most of the text (then it is probably a ToC entry).
+    refs = list(_REFS_HEAD.finditer(body))
+    if refs and refs[-1].start() > len(body) * 0.4:
+        body = body[:refs[-1].start()]
+    # Reference entries can also sit at chapter ends; drop lines shaped like one.
+    body = "\n".join(l for l in body.split("\n") if not _REF_ENTRY.match(l))
+    words = re.findall(r"[a-z]+", body.lower())
+    bm = sum(w in _BM_WORDS for w in words)
+    en = sum(w in _EN_WORDS for w in words)
+    ratio = bm / (bm + en) if bm + en else 0.0
+    return {"lang": "ms" if ratio > 0.5 else "en", "bm_ratio": round(ratio, 2)}
+
+def _lang_instruction(lang: str) -> str:
+    if lang == "ms":
+        return ("LANGUAGE: The thesis body is written in Bahasa Melayu. Write ALL feedback "
+                "(every sentence you produce, including every JSON string value) in formal "
+                "academic Bahasa Melayu following Dewan Bahasa dan Pustaka (DBP) spelling and "
+                "terminology. Keep names of theories, models, methods, statistical tests, authors "
+                "and citations in their original form (e.g. 'Theory of Planned Behaviour (Ajzen, "
+                "1991)', 'PLS-SEM'). Quote the thesis verbatim in its original language. Keep JSON "
+                "keys and the fixed labels (CRITICAL, MODERATE, SUGGESTION, ALIGNED, PARTIAL, "
+                "MISALIGNED, MISSING, UNCLEAR, STRONG, ACCEPTABLE, WEAK, BROKEN) in English exactly "
+                "as specified.")
+    return ("LANGUAGE: Write all feedback in formal academic English. Quote the thesis "
+            "verbatim in its original language.")
+
+# Report labels: (English, Bahasa Melayu)
+_LABELS = {
+    "examiner_title":   ("EXAMINER'S AUDIT REPORT", "LAPORAN AUDIT PEMERIKSA"),
+    "commentary_title": ("COMMENTARY REPORT", "LAPORAN ULASAN"),
+    "commentary_badge": ("PARAGRAPH-LEVEL COMMENTARY REPORT", "LAPORAN ULASAN PERINGKAT PERENGGAN"),
+    "commentary_sub":   ("Subsection-Level Supervisor Notes", "Catatan Penyelia Peringkat Subseksyen"),
+    "align_title":      ("ALIGNMENT MATRIX REPORT", "LAPORAN MATRIKS PENJAJARAN"),
+    "align_badge":      ("STRUCTURAL ALIGNMENT MATRIX", "MATRIKS PENJAJARAN STRUKTUR"),
+    "align_sub":        ("Golden Thread Audit", "Audit Benang Emas (Golden Thread)"),
+    "spine":            ("EXTRACTED THESIS SPINE", "TULANG BELAKANG TESIS YANG DIEKSTRAK"),
+    "spine_ref":        ("THESIS SPINE (for reference)", "TULANG BELAKANG TESIS (rujukan)"),
+    "golden_thread":    ("Golden Thread", "Benang Emas"),
+    "align_score_sub":  ("Structural Alignment Score", "Skor Penjajaran Struktur"),
+    "verdict_sub":      ("Examiner's Recommended Outcome", "Keputusan Disyorkan Pemeriksa"),
+    "issue_summary":    ("CHAPTER + SUBSECTION ISSUE SUMMARY", "RINGKASAN ISU BAB + SUBSEKSYEN"),
+    "overall_verdict":  ("OVERALL ALIGNMENT VERDICT", "RUMUSAN KESELURUHAN PENJAJARAN"),
+    "rq_trace":         ("ALIGNMENT MATRIX — RQ-LEVEL TRACE", "MATRIKS PENJAJARAN — JEJAK PERSOALAN KAJIAN"),
+    "row_notes":        ("ROW-BY-ROW NOTES", "CATATAN SETIAP BARIS"),
+    "chapter_links":    ("CHAPTER-TO-CHAPTER LINKS", "PAUTAN ANTARA BAB"),
+    "constructs":       ("CONSTRUCT CONSISTENCY ACROSS CHAPTERS", "KONSISTENSI KONSTRUK MERENTAS BAB"),
+    "critical_gaps":    ("CRITICAL STRUCTURAL GAPS", "JURANG STRUKTUR KRITIKAL"),
+    "struct_recs":      ("STRUCTURAL RECOMMENDATIONS", "CADANGAN STRUKTUR"),
+    "scorecard":        ("CHAPTER DELIVERY SCORECARD", "KAD SKOR PENYAMPAIAN BAB"),
+    "distribution":     ("OVERALL COMMENT DISTRIBUTION", "TABURAN KESELURUHAN ULASAN"),
+    "issue":            ("Issue", "Isu"),
+    "recommendation":   ("Recommendation", "Cadangan"),
+    "literature":       ("Literature needed", "Literatur diperlukan"),
+    "theory":           ("Theory / Framework", "Teori / Kerangka"),
+    "framework":        ("Suggested framework", "Kerangka dicadangkan"),
+    "method":           ("Suggested method/reference", "Kaedah/rujukan dicadangkan"),
+    "thread_link":      ("Golden-thread link affected", "Pautan benang emas terjejas"),
+    "verified_refs":    ("Supporting literature (verified records)", "Literatur sokongan (rekod disahkan)"),
+    "expected":         ("Expected purpose", "Tujuan dijangka"),
+    "evidence":         ("Evidence", "Bukti"),
+    "fix":              ("Fix", "Pembetulan"),
+    "broken_link":      ("Broken link", "Pautan terputus"),
+}
+_SEV_LABELS_MS = {"CRITICAL": "KRITIKAL", "MODERATE": "SEDERHANA", "SUGGESTION": "CADANGAN"}
+
+def L(key: str, lang: str) -> str:
+    en, ms = _LABELS[key]
+    return ms if lang == "ms" else en
+
+def sev_label(sev: str, lang: str) -> str:
+    return _SEV_LABELS_MS.get(sev, sev) if lang == "ms" else sev
+
+
 # ── Text extraction ─────────────────────────────────────────────
 def extract_text(content: bytes, filename: str) -> str:
     """Extract text from PDF or DOCX.
@@ -397,15 +576,18 @@ def extract_text(content: bytes, filename: str) -> str:
 # and "N.0 Title" forms (explicit section-zero heading).
 # The old (\d+)[:\.\-] branch was matching statistics (3.432, 0.521) as chapters.
 _WORD_NUMS = {"one":"1","two":"2","three":"3","four":"4","five":"5",
-              "six":"6","seven":"7","eight":"8","nine":"9","ten":"10"}
+              "six":"6","seven":"7","eight":"8","nine":"9","ten":"10",
+              "satu":"1","dua":"2","tiga":"3","empat":"4","lima":"5",
+              "enam":"6","tujuh":"7","lapan":"8","sembilan":"9","sepuluh":"10"}
 _ROMAN = {"I":"1","II":"2","III":"3","IV":"4","V":"5",
           "VI":"6","VII":"7","VIII":"8","IX":"9","X":"10"}
 
 _CH_PAT = re.compile(
-    r'(?:^|\n)'
+    r'(?:^|\n)[ \t]*'          # Word often indents/centres headings with tabs ("\tBAB 2")
     r'(?:'
       # "CHAPTER 1", "CHAPTER I", "CHAPTER ONE", "BAB 1", "BAHAGIAN 2"
-      r'(?:CHAPTER|BAHAGIAN|BAB)\s+(\d{1,2}|[IVX]+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN)\b'
+      r'(?:CHAPTER|BAHAGIAN|BAB)\s+(\d{1,2}|[IVX]+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN'
+      r'|SATU|DUA|TIGA|EMPAT|LIMA|ENAM|TUJUH|LAPAN|SEMBILAN|SEPULUH)\b'
       # "1.0 Introduction" or "2.0 Literature Review" — ONLY N.0 forms, not N.432
       r'|(\d{1,2})\.0+\s'
     r')'
@@ -456,12 +638,101 @@ _SUBSECTION_PURPOSE = {
     "recommendation":       "Specific, actionable recommendations for stakeholders.",
 }
 
+# Bahasa Melayu headings → the English key whose purpose applies.
+# Order matters: longer / more specific phrases first.
+_BM_PURPOSE_ALIASES = [
+    ("latar belakang", "background"), ("pernyataan masalah", "problem statement"),
+    ("penyataan masalah", "problem statement"), ("jurang kajian", "research gap"),
+    ("persoalan kajian", "research question"), ("soalan kajian", "research question"),
+    ("objektif", "objective"), ("hipotesis", "hypothes"),
+    ("kepentingan kajian", "significance"), ("signifikan", "significance"),
+    ("skop", "scope"), ("batasan kajian", "limitation"), ("limitasi", "limitation"),
+    ("definisi", "definition"), ("kerangka teori", "theoretical framework"),
+    ("kerangka teoretikal", "theoretical framework"), ("kerangka konsep", "conceptual framework"),
+    ("sorotan literatur", "literature review"), ("tinjauan literatur", "literature review"),
+    ("kajian lepas", "literature review"), ("reka bentuk", "research design"),
+    ("populasi", "population"), ("persampelan", "sampling"), ("sampel", "sampling"),
+    ("instrumen", "instrument"), ("kesahan", "validity"), ("kebolehpercayaan", "reliability"),
+    ("pengumpulan data", "data collection"), ("prosedur", "data collection"),
+    ("analisis data", "data analysis"), ("demografi", "demographic"),
+    ("deskriptif", "descriptive"), ("dapatan", "finding"), ("keputusan", "results"),
+    ("perbincangan", "discussion"), ("implikasi", "implication"),
+    ("kajian lanjutan", "future research"), ("kesimpulan", "conclusion"),
+    ("rumusan", "summary"), ("cadangan", "recommendation"),
+]
+
 def _purpose_for(title: str) -> str:
     t = title.lower()
     for k, v in _SUBSECTION_PURPOSE.items():
         if k in t:
             return v
+    for bm, key in _BM_PURPOSE_ALIASES:
+        if bm in t:
+            return _SUBSECTION_PURPOSE[key]
     return "Auditor should infer purpose from chapter context."
+
+
+# ── Chapter roles + what examiners check in each ──────────────
+_ROLE_KEYWORDS = [
+    ("literature_review", ("literature", "sorotan", "tinjauan", "kajian lepas", "kajian literatur")),
+    ("methodology",       ("method", "metodologi", "kaedah", "reka bentuk", "research design")),
+    ("discussion",        ("discussion", "perbincangan")),
+    ("results",           ("result", "finding", "data analysis", "analisis data", "dapatan", "analysis")),
+    ("conclusion",        ("conclusion", "kesimpulan", "rumusan", "recommendation", "cadangan", "summary")),
+    ("introduction",      ("introduction", "pengenalan", "pendahuluan", "background", "latar belakang")),
+]
+_ROLE_BY_POSITION = {"1": "introduction", "2": "literature_review", "3": "methodology",
+                     "4": "results", "5": "conclusion"}
+
+_CHAPTER_CHECKS = {
+    "introduction": (
+        "- Problem is evidenced (statistics, reports, prior studies), local AND international.\n"
+        "- Gap is specific (which population / context / construct / method is missing) and cited.\n"
+        "- RQs and ROs map 1-to-1 with measurable verbs; hypotheses follow from the theory.\n"
+        "- Scope and operational definitions match the constructs used in later chapters.\n"
+        "- Significance names concrete theoretical AND practical contributions."),
+    "literature_review": (
+        "- Synthesis, not author-by-author summary: themes, agreement/disagreement, trends.\n"
+        "- Every construct in the RQs is defined, reviewed and its measurement discussed.\n"
+        "- The underpinning theory is explained and explicitly linked to each hypothesised relationship.\n"
+        "- Currency: substantial share of sources from the last 5-7 years, plus seminal works.\n"
+        "- The gap emerges from this review and matches the gap claimed in Chapter 1.\n"
+        "- Conceptual framework is derived from theory + literature; every path is justified."),
+    "methodology": (
+        "- Paradigm and design are justified against the RQs.\n"
+        "- Population, sampling frame, technique and sample size justified (formula / power analysis).\n"
+        "- Instrument items map to EVERY construct; adapted items cite their source.\n"
+        "- Validity and reliability evidence with accepted thresholds; pilot study reported.\n"
+        "- Analysis technique stated per RQ/hypothesis; ethics and data procedures described."),
+    "results": (
+        "- Results are organised by RQ/hypothesis and every RQ/hypothesis is answered.\n"
+        "- Data screening / assumptions reported; statistics with effect sizes and thresholds.\n"
+        "- Tables and figures are interpreted, not just listed."),
+    "discussion": (
+        "- Each finding is interpreted against the Chapter 2 literature (agree/disagree and why).\n"
+        "- The underpinning theory is used to explain the findings; unexpected results explained.\n"
+        "- No new results introduced."),
+    "conclusion": (
+        "- Each RQ is answered explicitly.\n"
+        "- Contributions match those promised in Chapter 1 and are supported by the findings.\n"
+        "- Implications are grounded in findings; no overclaiming beyond sample and design.\n"
+        "- Limitations are honest; future research is specific and actionable."),
+    "other": "- Infer the section's role and judge whether it serves the thesis argument.",
+}
+
+def chapter_role(cs) -> str:
+    role = (cs.digest or {}).get("chapter_role", "")
+    if role in _CHAPTER_CHECKS:
+        return role
+    t = cs.chapter_title.lower()
+    for r, kws in _ROLE_KEYWORDS:
+        if any(k in t for k in kws):
+            # Every chapter opens with an "Introduction"/"Pendahuluan" subsection, which
+            # the splitter sometimes takes as the chapter title; only trust it for Ch 1.
+            if r == "introduction" and cs.chapter_num != "1":
+                break
+            return r
+    return _ROLE_BY_POSITION.get(cs.chapter_num, "other")
 
 import textwrap
 
@@ -497,6 +768,10 @@ def split_chapters(text: str) -> list[ChapterSummary]:
         # Stop the title at the first sign it has bled into a numbered
         # subsection heading (e.g. "LITERATURE REVIEW 2.1 Introduction")
         title = re.split(r'\s+\d{1,2}\.\d', title)[0].strip()
+        # "Bab 1 ini membincangkan ..." / "Chapter 2 reviews ..." is a sentence
+        # referring to a chapter, not a heading: headings aren't lower-case.
+        if title and title[0].islower():
+            continue
         if not title:
             next_nl = text.find("\n", m.end())
             title = text[m.end():next_nl].strip() if next_nl != -1 else f"Chapter {num}"
@@ -515,7 +790,34 @@ def split_chapters(text: str) -> list[ChapterSummary]:
         chapters.append(ChapterSummary(
             chapter_num=num, chapter_title=title,
             text=text[start:end].strip(), char_offset=start))
+    _recover_chapter_one(text, chapters)
     return chapters or [ChapterSummary("1", "Full Document", text, 0)]
+
+_TOC_LINE = re.compile(r'(?:\t|\.{3,}|\s{2,})\s*\d{1,3}\s*$')
+
+def _recover_chapter_one(text: str, chapters: list) -> None:
+    """If Chapter 1's body heading wasn't recognised, only its Table-of-Contents line
+    survives (a few hundred chars) and the real Chapter 1 is lost. Rebuild it from
+    the first body "1.1 ..." heading up to the start of Chapter 2."""
+    ch1 = next((c for c in chapters if c.chapter_num == "1"), None)
+    ch2 = next((c for c in chapters if c.chapter_num == "2"), None)
+    if not ch2 or (ch1 and len(ch1.text) >= 2000):
+        return
+    for m in re.finditer(r'(?:^|\n)[ \t]*1\.1[ \t]+\S[^\n]*', text[:ch2.char_offset]):
+        line = m.group(0).strip()
+        following = text[m.end():m.end() + 600].split("\n")[1:6]
+        if _TOC_LINE.search(line) or sum(bool(_TOC_LINE.search(x)) for x in following) >= 2:
+            continue                                   # still inside the ToC
+        start = m.start()
+        body = text[start:ch2.char_offset].strip()
+        if len(body) < 2000:
+            continue
+        if ch1:
+            ch1.text, ch1.char_offset = body, start
+        else:
+            chapters.insert(0, ChapterSummary("1", "Introduction", body, start))
+        print(f"[ThesisSifu] Recovered Chapter 1 body ({len(body):,} chars)")
+        return
 
 def split_subsections(chapter: ChapterSummary) -> list[Subsection]:
     """Split a chapter into subsections.
@@ -577,9 +879,11 @@ def _find_content_start(text: str) -> int:
     Returns the char position where substantive academic content begins.
     Looks for the Abstract, then Chapter 1, then any 'Introduction' heading."""
     markers = ["abstract\n", "Abstract\n", "ABSTRACT\n",
+               "ABSTRAK\n", "Abstrak\n",
                "CHAPTER 1\n", "Chapter 1\n", "CHAPTER ONE\n",
-               "1.1 Introduction\n", "1.1 Background\n",
-               "Introduction\n1.", "INTRODUCTION\n"]
+               "BAB 1\n", "BAB SATU\n", "Bab 1\n",
+               "1.1 Introduction\n", "1.1 Background\n", "1.1 Pengenalan\n",
+               "Introduction\n1.", "INTRODUCTION\n", "PENGENALAN\n"]
     best = len(text)
     for marker in markers:
         pos = text.find(marker)
@@ -587,6 +891,44 @@ def _find_content_start(text: str) -> int:
             best = pos
     # If nothing found in reasonable range, start at 0
     return best if best < len(text) * 0.3 else 0
+
+_NUMBERED_HEADING = re.compile(r'^\s*\d{1,2}\.\d{1,3}(?:\.\d{1,3})?\s+\S')
+
+def _lines_after_heading(text: str, headings: tuple, keep, limit: int = 8) -> list:
+    """Items listed under the LAST body occurrence of a heading (e.g. 'Persoalan Kajian').
+    Word list numbering is lost in extraction, so RQs/ROs arrive as bare lines; we
+    collect lines that pass `keep` until the next numbered heading."""
+    pat = re.compile(r'^[ \t]*(?:\d{1,2}\.\d{1,2}[ \t]+)?(?:' + "|".join(headings) + r')[ \t]*:?[ \t]*$',
+                     re.IGNORECASE | re.MULTILINE)
+    heads = [m for m in pat.finditer(text)]
+    if not heads:
+        return []
+    # Re-join items that Word wrapped onto several lines (no closing punctuation yet).
+    lines, buf = [], ""
+    for line in text[heads[-1].end():].split("\n")[1:40]:
+        s = line.strip()
+        if not s:
+            continue
+        if _NUMBERED_HEADING.match(s) or re.match(r'^(BAB|CHAPTER)\s', s, re.IGNORECASE):
+            if buf: lines.append(buf)
+            buf = ""
+            lines.append(None)                     # stop marker
+            break
+        buf = f"{buf} {s}".strip()
+        if re.search(r'(?:[?.:;]|;\s*(?:dan|and|atau|or))\s*\.?$', buf, re.IGNORECASE):
+            lines.append(buf); buf = ""
+    if buf:
+        lines.append(buf)
+    out = []
+    for s in lines:
+        if s is None:
+            break
+        s = re.sub(r'^(?:\(?[a-z0-9ivx]{1,4}[\.\)])\s+', '', s, flags=re.IGNORECASE)
+        if keep(s):
+            out.append(s)
+        if len(out) >= limit:
+            break
+    return out
 
 def _extract_spine_fallback(text: str) -> dict:
     """Rule-based spine extraction as fallback when Gemini fails.
@@ -614,16 +956,31 @@ def _extract_spine_fallback(text: str) -> dict:
     if not rq_matches:
         rq_matches = re.findall(
             r'Research Question \d+\s*[:：]\s*([^\n?]+\??)', text, re.IGNORECASE)
+    if not rq_matches:
+        # BM: "Persoalan Kajian 1: ..." / "SK1: ..." / numbered "Adakah/Apakah/Sejauh manakah ...?"
+        rq_matches = re.findall(
+            r'(?:Persoalan Kajian|Soalan Kajian|SK)\s*\d+\s*[:：]\s*([^\n?]+\??)', text, re.IGNORECASE)
+    if not rq_matches:
+        rq_matches = _lines_after_heading(
+            text, ("Persoalan Kajian", "Soalan Kajian", "Research Questions?"),
+            keep=lambda s: s.rstrip(" .").endswith("?") and len(s) > 20)
     d["research_questions"] = [r.strip() for r in rq_matches[:6]]
 
-    # Research Objectives: numbered "To verb..." lists
+    # Research Objectives: numbered "To verb..." / BM "Mengenal pasti / Mengkaji ..." lists
     ro_matches = re.findall(
         r'\d+\.\s+(To\s+(?:identify|examine|determine|explore|assess|investigate|describe|compare|evaluate|analyse|analyze)[^\n\.]{10,200})',
         text, re.IGNORECASE)
+    if not ro_matches:
+        ro_matches = _lines_after_heading(
+            text, ("Objektif Kajian", "Research Objectives?"),
+            keep=lambda s: bool(re.match(
+                r'(?:To\s+\w+|(?:Untuk\s+)?(?:mengenal\s*pasti|mengenalpasti|mengkaji|menentukan|meneroka|'
+                r'menilai|menganalisis|meninjau|membandingkan|menghuraikan|meneliti|mengukur))',
+                s, re.IGNORECASE)) and len(s) > 20)
     d["research_objectives"] = [r.strip() for r in ro_matches[:6]]
 
-    # Hypotheses
-    h_matches = re.findall(r'H[01]\d*\s*[:：]\s*([^\n\.]{10,200})', text)
+    # Hypotheses (H1:, H01:, Ho1:)
+    h_matches = re.findall(r'H[0o1]?\d+\s*[:：]\s*([^\n\.]{10,200})', text)
     d["hypotheses"] = [h.strip() for h in h_matches[:6]]
 
     # Methodology keywords
@@ -723,37 +1080,43 @@ Document excerpt (front + back samples):
 \"\"\"EXCERPT_PLACEHOLDER\"\"\"\
 """
 
-async def extract_spine(text: str, full_text: str) -> ThesisSpine:
-    # ── Smart sampling: skip preamble, start from Abstract/Chapter 1 ──────────
+_RQ_ANCHORS = ("RQ1", "Research Question 1", "Research Questions", "RESEARCH QUESTIONS",
+               "Persoalan Kajian", "PERSOALAN KAJIAN", "Objektif Kajian", "OBJEKTIF KAJIAN",
+               "Research Objectives", "RESEARCH OBJECTIVES")
+
+def _spine_sample(text: str, chs: list) -> str:
+    """Build the excerpt Gemini reads to extract the spine.
+    With real chapters: all of Chapter 1's front, the opening of each middle
+    chapter (method / results), and the opening of the LAST chapter, where the
+    conclusions are. (text[-3000:] is usually the reference list or appendices.)"""
+    real = [c for c in chs if not c.chapter_title.startswith("Section ")]
+    if len(real) >= 3:
+        parts = [f"[CHAPTER {real[0].chapter_num}]\n" + real[0].text[:18000]]
+        for c in real[1:-1][:4]:
+            parts.append(f"[CHAPTER {c.chapter_num} — opening]\n" + c.text[:5000])
+        parts.append(f"[CHAPTER {real[-1].chapter_num} — final chapter]\n" + real[-1].text[:12000])
+        return "\n\n[...]\n\n".join(parts)[:45000]
+
     content_start = _find_content_start(text)
-    if content_start > 0:
-        print(f"[ThesisSifu] Skipping {content_start} chars of preamble for spine")
-    # Take front from content start, middle from RQ area, back from conclusions
     content = text[content_start:]
-    front  = content[:6000]
-    # Try to find the RQ section specifically
-    rq_pos = text.find("RQ1:") or text.find("Research Question 1")
-    if rq_pos > 0:
-        middle = text[max(0, rq_pos-200):rq_pos+2000]
-    else:
-        middle = content[4000:8000] if len(content) > 8000 else ""
-    back   = text[-3000:] if len(text) > 15000 else ""
-    sample = (front + "\n\n[...RQ section...]\n\n" + middle +
-              "\n\n[...conclusion section...]\n\n" + back)[:14000]
-    prompt = _SPINE_PROMPT.replace("EXCERPT_PLACEHOLDER", sample)
+    front = content[:8000]
+    rq_pos = min((p for p in (text.find(a) for a in _RQ_ANCHORS) if p > 0), default=-1)
+    middle = text[max(0, rq_pos - 200):rq_pos + 3000] if rq_pos > 0 else content[8000:12000]
+    concl = max(text.rfind("CONCLUSION"), text.rfind("KESIMPULAN"), text.rfind("Conclusion"))
+    back = text[concl:concl + 6000] if concl > len(text) * 0.5 else text[-6000:]
+    return (front + "\n\n[...RQ section...]\n\n" + middle +
+            "\n\n[...conclusion section...]\n\n" + back)[:30000]
+
+async def extract_spine(text: str, chs: list) -> ThesisSpine:
+    prompt = _SPINE_PROMPT.replace("EXCERPT_PLACEHOLDER", _spine_sample(text, chs))
 
     d = None
-    if gemini_client and text.strip():
-        try:
-            r = await gemini_client.aio.models.generate_content(
-                model=GEMINI_MODEL, contents=prompt)
-            raw = _gemini_text(r, "spine_extraction")
-            if raw:
-                raw = re.sub(r"```(?:json)?", "", raw).strip("`").strip()
-                d = json.loads(raw)
-                print(f"[ThesisSifu] Gemini spine: RQs={len(d.get('research_questions',[]))}")
-        except Exception as e:
-            print(f"[ThesisSifu] Spine Gemini error: {e}")
+    if text.strip():
+        d = await _gemini_json(prompt, "spine_extraction")
+        if not isinstance(d, dict):
+            d = None
+        else:
+            print(f"[ThesisSifu] Gemini spine: RQs={len(d.get('research_questions',[]))}")
 
     # ── Fallback: rule-based extraction if Gemini failed or returned mostly NOT FOUND ──
     if d is None:
@@ -815,17 +1178,95 @@ async def classify_document(text: str) -> dict:
     if not gemini_client or not text.strip():
         return default
     prompt = _CLS_PROMPT.replace("EXCERPT_PLACEHOLDER", text[:5000])
-    try:
-        r = await gemini_client.aio.models.generate_content(
-            model=GEMINI_MODEL, contents=prompt)
-        raw = _gemini_text(r, "classify_document")
-        if not raw:
-            return default
-        raw = re.sub(r"```(?:json)?","", raw).strip("`").strip()
-        return json.loads(raw)
-    except Exception as e:
-        print(f"[ThesisSifu] Classification error: {e}")
+    d = await _gemini_json(prompt, "classify_document")
+    if not isinstance(d, dict):
         return default
+    return {**default, **d}
+
+
+# ── Stage 2b: Chapter digests (the golden-thread map) ─────────
+_DIGEST_PROMPT = """\
+You are reading ONE chapter of a thesis to record what it COMMITS to, so an examiner can
+later check the golden thread across chapters (Problem -> Gap -> RQ/RO/H -> Theory/Constructs
+-> Design/Instrument -> Analysis -> Findings -> Discussion -> Conclusion/Contribution).
+
+CHAPTER CHNUM_PLACEHOLDER — CHTITLE_PLACEHOLDER
+
+Return STRICT JSON only:
+{
+  "chapter_role": "introduction|literature_review|methodology|results|discussion|conclusion|other",
+  "summary": "3-5 sentences in English on what this chapter actually does",
+  "commitments": [
+    {"type": "problem|gap|research_question|objective|hypothesis|theory|construct|conceptual_framework|design|sample|instrument|measurement|analysis|finding|interpretation|contribution|implication|limitation|recommendation|conclusion",
+     "label": "short id, e.g. RQ2, H3, Self-efficacy, PLS-SEM",
+     "statement": "what the chapter says, one sentence in English",
+     "quote": "verbatim supporting text from the chapter, max 200 characters, original language",
+     "section": "section number if visible (e.g. 3.4.2), else empty"}
+  ],
+  "constructs": ["every variable / construct / theme named in this chapter, worded exactly as in the text"]
+}
+
+Record at most 30 commitments. Prioritise: RQs, objectives, hypotheses, the underpinning theory,
+each construct and HOW it is measured (instrument, items, source), the analysis used for each
+RQ/hypothesis, the finding for each RQ/hypothesis, and claimed contributions. Record only what
+the text says; do not judge quality here.
+
+Chapter text:
+\"\"\"TEXT_PLACEHOLDER\"\"\"\
+"""
+
+async def digest_chapter(cs: ChapterSummary) -> None:
+    prompt = (_DIGEST_PROMPT
+              .replace("CHNUM_PLACEHOLDER", cs.chapter_num)
+              .replace("CHTITLE_PLACEHOLDER", cs.chapter_title[:80])
+              .replace("TEXT_PLACEHOLDER", cs.text[:150000]))
+    d = await _gemini_json(prompt, f"digest_ch{cs.chapter_num}")
+    if isinstance(d, dict):
+        d["commitments"] = [c for c in _flatten_to_list(d.get("commitments")) if isinstance(c, dict)][:30]
+        d["constructs"] = [str(x) for x in _flatten_to_list(d.get("constructs"))][:40]
+        cs.digest = d
+        print(f"[ThesisSifu] Digest ch{cs.chapter_num}: role={d.get('chapter_role')} "
+              f"commitments={len(d['commitments'])}")
+
+async def digest_chapters(chs: list) -> None:
+    sem = asyncio.Semaphore(6)
+    async def one(cs):
+        async with sem:
+            await digest_chapter(cs)
+    await asyncio.gather(*(one(cs) for cs in chs if cs.text.strip()))
+
+_THREAD_TYPES = ("research_question", "objective", "hypothesis", "theory", "construct",
+                 "conceptual_framework", "instrument", "measurement", "analysis",
+                 "finding", "contribution", "conclusion")
+
+def thread_context(chs: list, limit: int = 4000) -> str:
+    """Compact cross-chapter commitments, given to every subsection auditor so it
+    can judge a paragraph against what OTHER chapters promise or report."""
+    lines = []
+    for cs in chs:
+        for c in cs.digest.get("commitments", []):
+            if c.get("type") in _THREAD_TYPES:
+                lines.append(f"Ch{cs.chapter_num} {c.get('type')} {c.get('label','')}: "
+                             f"{_shorten(str(c.get('statement','')), 160)}")
+    return "\n".join(lines)[:limit] or "(not available)"
+
+def digests_block(chs: list, limit: int = 70000) -> str:
+    """Full digest text for the alignment audit."""
+    out = []
+    for cs in chs:
+        d = cs.digest
+        if not d:
+            out.append(f"=== Chapter {cs.chapter_num} — {cs.chapter_title} === (digest unavailable)")
+            continue
+        out.append(f"=== Chapter {cs.chapter_num} — {cs.chapter_title} (role: {chapter_role(cs)}) ===")
+        out.append(f"Summary: {d.get('summary','')}")
+        for c in d.get("commitments", []):
+            sec = f" (§{c['section']})" if c.get("section") else ""
+            out.append(f"- [{c.get('type','')}] {c.get('label','')}: {c.get('statement','')}{sec}"
+                       f"\n    quote: \"{_shorten(str(c.get('quote','')), 200)}\"")
+        if d.get("constructs"):
+            out.append("Constructs named: " + "; ".join(d["constructs"]))
+    return "\n".join(out)[:limit]
 
 
 # ── Stage 2: Subsection paragraph audit ───────────────────────
@@ -833,119 +1274,394 @@ async def classify_document(text: str) -> dict:
 # one of 70+ parallel calls, blowing the total processing time past Railway's timeout.
 # Gemini still recommends frameworks/methods by name from its training knowledge.
 _SUBSECTION_PROMPT_TEMPLATE = """\
-You are a PhD supervisor auditing one SUBSECTION of a DOC_TYPE_PLACEHOLDER.
+You are a rigorous but fair thesis supervisor auditing one SUBSECTION of a DOC_TYPE_PLACEHOLDER.
+Your feedback must be specific enough that the student knows exactly what to change.
 
-THESIS SPINE (cite these in every comment):
+LANG_PLACEHOLDER
+
+THESIS SPINE:
   Title:      TITLE_PLACEHOLDER
   Problem:    PROBLEM_PLACEHOLDER
+  Gap:        GAP_PLACEHOLDER
   RQs:        RQS_PLACEHOLDER
   ROs:        ROS_PLACEHOLDER
+  Hypotheses: HYPS_PLACEHOLDER
   Theory:     THEORY_PLACEHOLDER
   Method:     METHOD_PLACEHOLDER
   Analysis:   ANALYSIS_PLACEHOLDER
 
-CHAPTER CHNUM_PLACEHOLDER — CHTITLE_PLACEHOLDER
+WHAT THE OTHER CHAPTERS COMMIT TO (golden-thread map — use it to catch cross-chapter breaks):
+THREAD_PLACEHOLDER
+
+CHAPTER CHNUM_PLACEHOLDER — CHTITLE_PLACEHOLDER (role: ROLE_PLACEHOLDER)
 SUBSECTION SUBNUM_PLACEHOLDER — SUBTITLE_PLACEHOLDER
 Expected purpose: PURPOSE_PLACEHOLDER
-CURRENT YEAR: YEAR_PLACEHOLDER (Do not flag 2024, 2025, or 2026 citations as "future" or "unpublished").
+What examiners check in this kind of chapter:
+CHECKS_PLACEHOLDER
+CURRENT YEAR: YEAR_PLACEHOLDER (Do not flag 2024-YEAR_PLACEHOLDER citations as "future" or "unpublished").
 
-For 3-6 paragraphs needing attention, return a JSON array. Each element:
+Report 0-5 GENUINE issues — only real weaknesses an examiner would raise. Do not pad: if the
+subsection is sound, return []. Prefer substantive issues (argument, evidence, alignment,
+method, interpretation) over wording. Return a JSON array; each element:
 {
-  "para_excerpt": "first 80 chars verbatim",
+  "para_excerpt": "first 80 characters of the paragraph, copied verbatim",
   "severity": "CRITICAL|MODERATE|SUGGESTION",
-  "issue": "specific intellectual problem referencing the spine above",
-  "recommendation": "specific fix",
-  "literature_needed": "type of evidence needed (no invented titles)",
-  "theory_needed": "named framework or none",
-  "suggested_framework": "e.g. TAM (Davis 1989) or empty string",
-  "suggested_method": "e.g. PLS-SEM (Hair et al. 2017) or empty string"
+  "issue": "what is wrong AND why it matters to an examiner; name the exact claim, construct or RQ involved",
+  "golden_thread_link": "the cross-chapter link affected, e.g. 'RQ2 -> Ch3 instrument' or 'Ch1 gap -> Ch2 synthesis'; empty if none",
+  "recommendation": "the concrete fix: what to add, remove or restructure, with a short example sentence or structure where useful",
+  "literature_needed": "the kind of evidence needed (e.g. 'recent empirical studies on X among Y in Malaysia')",
+  "search_query": "4-8 English keywords to find peer-reviewed literature supporting the fix; empty if no literature is needed",
+  "theory_needed": "named theory/framework or none",
+  "suggested_framework": "e.g. TAM (Davis, 1989) or empty string",
+  "suggested_method": "e.g. PLS-SEM (Hair et al., 2022) or empty string"
 }
 
-Flag CRITICAL when: paragraph contradicts RQs/ROs, subsection misses its purpose,
-method cannot answer the RQ, finding doesn't map to any RQ, conclusion overreaches.
+Severity:
+  CRITICAL   — breaks the golden thread or validity: contradicts/ignores an RQ, RO or hypothesis;
+               a construct is not measured or not analysed; the method cannot answer the RQ; a
+               finding maps to no RQ; a conclusion overreaches the data; the subsection fails its purpose.
+  MODERATE   — weakens the argument: unsupported claim, descriptive rather than critical synthesis,
+               outdated or thin evidence, missing justification or threshold, unclear operationalisation.
+  SUGGESTION — would strengthen an already acceptable section.
 
-Return ONLY the JSON array. No markdown fences.
+Never invent references, titles or DOIs; describe the evidence needed instead.
+Return ONLY the JSON array.
 
 Subsection text:
 \"\"\"TEXT_PLACEHOLDER\"\"\"\
 """
 
-async def audit_subsection(sub: Subsection, ch_title: str, doc_type: str,
-                            spine: ThesisSpine, full_text: str) -> list[ParagraphComment]:
+async def audit_subsection(sub: Subsection, cs: ChapterSummary, doc_type: str,
+                            spine: ThesisSpine, full_text: str, thread: str,
+                            lang: str) -> list[ParagraphComment]:
     if not gemini_client or not sub.text.strip():
         return []
+    role = chapter_role(cs)
+    year = str(datetime.now().year)
     prompt = (
         _SUBSECTION_PROMPT_TEMPLATE
         .replace("DOC_TYPE_PLACEHOLDER", doc_type)
+        .replace("LANG_PLACEHOLDER",     _lang_instruction(lang))
         .replace("TITLE_PLACEHOLDER",    spine.title[:150])
-        .replace("PROBLEM_PLACEHOLDER",  spine.problem_statement[:200])
-        .replace("RQS_PLACEHOLDER",      "; ".join(spine.research_questions[:4]) or "NOT FOUND")
-        .replace("ROS_PLACEHOLDER",      "; ".join(spine.research_objectives[:4]) or "NOT FOUND")
-        .replace("THEORY_PLACEHOLDER",   spine.theory_used[:100])
-        .replace("METHOD_PLACEHOLDER",   spine.methodology[:100])
-        .replace("ANALYSIS_PLACEHOLDER", spine.analysis_technique[:100])
+        .replace("PROBLEM_PLACEHOLDER",  spine.problem_statement[:300])
+        .replace("GAP_PLACEHOLDER",      spine.research_gap[:250])
+        .replace("RQS_PLACEHOLDER",      "; ".join(spine.research_questions[:6]) or "NOT FOUND")
+        .replace("ROS_PLACEHOLDER",      "; ".join(spine.research_objectives[:6]) or "NOT FOUND")
+        .replace("HYPS_PLACEHOLDER",     "; ".join(spine.hypotheses[:8]) or "none stated")
+        .replace("THEORY_PLACEHOLDER",   spine.theory_used[:150])
+        .replace("METHOD_PLACEHOLDER",   spine.methodology[:150])
+        .replace("ANALYSIS_PLACEHOLDER", spine.analysis_technique[:150])
+        .replace("THREAD_PLACEHOLDER",   thread)
         .replace("CHNUM_PLACEHOLDER",    sub.chapter_num)
-        .replace("CHTITLE_PLACEHOLDER",  ch_title[:60])
+        .replace("CHTITLE_PLACEHOLDER",  cs.chapter_title[:60])
+        .replace("ROLE_PLACEHOLDER",     role)
         .replace("SUBNUM_PLACEHOLDER",   sub.subsection_num)
         .replace("SUBTITLE_PLACEHOLDER", sub.title[:60])
         .replace("PURPOSE_PLACEHOLDER",  sub.expected_purpose[:150])
-        .replace("FRAMEWORKS_PLACEHOLDER",    CANONICAL_FRAMEWORKS)
-        .replace("METHODS_PLACEHOLDER",       CANONICAL_METHODS)
+        .replace("CHECKS_PLACEHOLDER",   _CHAPTER_CHECKS.get(role, _CHAPTER_CHECKS["other"]))
+        .replace("YEAR_PLACEHOLDER",     year)
+        .replace("TEXT_PLACEHOLDER",     sub.text[:60000])
     )
     ctx = f"ch{sub.chapter_num}.{sub.subsection_num}"
-    try:
-        r = await gemini_client.aio.models.generate_content(
-            model=GEMINI_MODEL, contents=prompt)
-        raw = _gemini_text(r, f"audit_subsection_{ctx}")
-        if not raw:
-            print(f"[ThesisSifu] Empty response for subsection {ctx}")
-            return []
-        raw = re.sub(r"```(?:json)?", "", raw).strip("`").strip()
-        # Gemini sometimes returns a single object instead of array — wrap it
-        if raw.startswith("{"):
-            raw = "[" + raw + "]"
-        items = json.loads(raw)
-        if not isinstance(items, list):
-            items = [items]
-        comments = []
-        for idx, it in enumerate(items):
-            excerpt = str(it.get("para_excerpt",""))[:150]
-            pg = _estimate_page(full_text, excerpt, sub.char_offset)
-            comments.append(ParagraphComment(
-                chapter=            f"Chapter {sub.chapter_num}",
-                subsection=         sub.subsection_num,
-                subsection_title=   sub.title,
-                para_index=         idx,
-                page_estimate=      pg,
-                para_excerpt=       excerpt,
-                severity=           str(it.get("severity","MODERATE")).upper(),
-                issue=              str(it.get("issue","")),
-                recommendation=     str(it.get("recommendation","")),
-                literature_needed=  str(it.get("literature_needed","")),
-                theory_needed=      str(it.get("theory_needed","none")),
-                suggested_framework=str(it.get("suggested_framework","")),
-                suggested_method=   str(it.get("suggested_method","")),
-            ))
-        print(f"[ThesisSifu] {ctx}: {len(comments)} comments")
-        return comments
-    except json.JSONDecodeError as e:
-        print(f"[ThesisSifu] JSON parse error in {ctx}: {e}\nRaw: {raw[:300]}")
+    items = await _gemini_json(prompt, f"audit_subsection_{ctx}")
+    if items is None:
         return []
-    except Exception as e:
-        print(f"[ThesisSifu] Subsection audit error {ctx}: {e}\n{traceback.format_exc()}")
+    if isinstance(items, dict):     # a single object instead of an array
+        items = [items]
+    comments = []
+    for idx, it in enumerate(x for x in items if isinstance(x, dict)):
+        excerpt = str(it.get("para_excerpt",""))[:150]
+        sev = str(it.get("severity","MODERATE")).upper()
+        comments.append(ParagraphComment(
+            chapter=            f"Chapter {sub.chapter_num}",
+            subsection=         sub.subsection_num,
+            subsection_title=   sub.title,
+            para_index=         idx,
+            page_estimate=      _estimate_page(full_text, excerpt, sub.char_offset),
+            para_excerpt=       excerpt,
+            severity=           sev if sev in SEV_COLORS else "MODERATE",
+            issue=              _flatten_to_str(it.get("issue","")),
+            recommendation=     _flatten_to_str(it.get("recommendation","")),
+            literature_needed=  _flatten_to_str(it.get("literature_needed","")),
+            theory_needed=      _flatten_to_str(it.get("theory_needed","none")),
+            suggested_framework=_flatten_to_str(it.get("suggested_framework","")),
+            suggested_method=   _flatten_to_str(it.get("suggested_method","")),
+            golden_thread_link= _flatten_to_str(it.get("golden_thread_link","")),
+            search_query=       _flatten_to_str(it.get("search_query","")),
+        ))
+    print(f"[ThesisSifu] {ctx}: {len(comments)} comments")
+    return comments
+
+
+# ── Stage 3b: Literature grounding (real, retrievable works only) ──
+# The model never writes a reference. We search a scholarly index with the
+# comment's keywords, then the model may only PICK from the records returned,
+# so every reference in the reports exists, with a DOI or URL.
+def _http_get_json(url: str, timeout: float = 15.0, retries: int = 2):
+    """GET JSON, backing off on HTTP 429 (Crossref's public pool rate-limits hard)."""
+    import time, urllib.error
+    headers = {"User-Agent": "ThesisSifuPro/4.2" + (f" (mailto:{LITERATURE_MAILTO})" if LITERATURE_MAILTO else "")}
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or attempt == retries:
+                raise
+            wait = e.headers.get("Retry-After", "")
+            time.sleep(min(float(wait), 10.0) if wait.replace(".", "", 1).isdigit() else 2.0 * (attempt + 1))
+
+def _openalex_abstract(inv) -> str:
+    if not isinstance(inv, dict):
+        return ""
+    pos = sorted((p, w) for w, ps in inv.items() for p in ps)
+    return " ".join(w for _, w in pos)
+
+def _search_openalex(query: str, n: int) -> list:
+    params = {
+        "search": query, "per_page": n,
+        "filter": "from_publication_date:2010-01-01,type:article|review|book-chapter",
+        "select": "id,doi,display_name,publication_year,cited_by_count,authorships,"
+                  "primary_location,abstract_inverted_index",
+        "api_key": OPENALEX_API_KEY,
+    }
+    d = _http_get_json("https://api.openalex.org/works?" + urllib.parse.urlencode(params))
+    out = []
+    for w in d.get("results", []):
+        src = ((w.get("primary_location") or {}).get("source") or {})
+        out.append({
+            "title":   w.get("display_name") or "",
+            "year":    w.get("publication_year"),
+            "authors": [_split_name(a.get("author", {}).get("display_name", "")) for a in w.get("authorships", [])],
+            "venue":   src.get("display_name") or "",
+            "doi":     (w.get("doi") or "").replace("https://doi.org/", ""),
+            "url":     w.get("doi") or w.get("id") or "",
+            "cited_by": w.get("cited_by_count") or 0,
+            "abstract": _openalex_abstract(w.get("abstract_inverted_index")),
+        })
+    return out
+
+def _search_crossref(query: str, n: int) -> list:
+    params = {
+        "query.bibliographic": query, "rows": n,
+        "filter": "from-pub-date:2010,type:journal-article",
+        "select": "DOI,title,author,issued,container-title,is-referenced-by-count,abstract",
+    }
+    if LITERATURE_MAILTO:
+        params["mailto"] = LITERATURE_MAILTO
+    d = _http_get_json("https://api.crossref.org/works?" + urllib.parse.urlencode(params))
+    out = []
+    for w in d.get("message", {}).get("items", []):
+        parts = (w.get("issued") or {}).get("date-parts") or [[None]]
+        out.append({
+            "title":   (w.get("title") or [""])[0],
+            "year":    parts[0][0] if parts and parts[0] else None,
+            "authors": [(a.get("family", ""), a.get("given", "")) for a in w.get("author", []) if a.get("family")],
+            "venue":   (w.get("container-title") or [""])[0],
+            "doi":     w.get("DOI") or "",
+            "url":     f"https://doi.org/{w['DOI']}" if w.get("DOI") else "",
+            "cited_by": w.get("is-referenced-by-count") or 0,
+            "abstract": re.sub(r"<[^>]+>", " ", w.get("abstract") or ""),
+        })
+    return out
+
+async def search_literature(query: str, n: int = 6) -> list:
+    """Real works for a query: OpenAlex when keyed, Crossref otherwise (each falls back to the other)."""
+    order = [_search_openalex, _search_crossref] if OPENALEX_API_KEY else [_search_crossref]
+    for fn in order:
+        try:
+            works = await asyncio.to_thread(fn, query, n)
+            works = [w for w in works if w["title"] and w["year"] and w["url"]]
+            if works:
+                return works
+        except Exception as e:
+            print(f"[ThesisSifu] Literature search via {fn.__name__} failed for '{query}': {e}")
+    return []
+
+_NAME_PARTICLES = {"de", "da", "di", "van", "von", "der", "den", "del", "la", "le", "du", "dos"}
+
+def _split_name(display: str) -> tuple:
+    """'Debbie De Neve' -> ('De Neve', 'Debbie'). Used when only a display name exists."""
+    parts = display.split()
+    if not parts:
+        return ("", "")
+    i = len(parts) - 1
+    while i > 0 and parts[i - 1].lower() in _NAME_PARTICLES:
+        i -= 1
+    return (" ".join(parts[i:]), " ".join(parts[:i]))
+
+def format_citation(w: dict) -> str:
+    """APA-style citation from a retrieved record."""
+    def short(name: tuple) -> str:
+        family, given = name
+        initials = " ".join(p[0] + "." for p in re.split(r"[\s\-]+", given) if p)
+        return f"{family}, {initials}".strip().rstrip(",")
+    names = [short(a) for a in w.get("authors", []) if a and a[0]][:20]
+    if not names:
+        auth = "Anon."
+    elif len(names) == 1:
+        auth = names[0]
+    elif len(names) <= 3:
+        auth = ", ".join(names[:-1]) + ", & " + names[-1]
+    else:
+        auth = names[0] + " et al."
+    venue = f" {w['venue']}." if w.get("venue") else ""
+    link = f" https://doi.org/{w['doi']}" if w.get("doi") else (f" {w['url']}" if w.get("url") else "")
+    return f"{auth} ({w.get('year')}). {w.get('title','').rstrip('.')}.{venue}{link}"
+
+_LIT_SELECT_PROMPT = """\
+You are helping a thesis supervisor attach REAL supporting literature to feedback comments.
+For each comment you are given candidate works retrieved from a scholarly database.
+Pick up to 3 candidates per comment that DIRECTLY help the student fix the issue (evidence,
+definitions, measurement, method, or theory). Prefer well-cited and recent (last ~10 years)
+peer-reviewed work. If no candidate is genuinely relevant, pick none — never force a match.
+
+LANG_PLACEHOLDER
+
+Return STRICT JSON only:
+{"selections": [{"comment_id": "c3", "picks": [{"candidate_id": "c3-2", "how_to_use": "one sentence: what to take from this source and where in the thesis to use it"}]}]}
+Use only comment_id and candidate_id values shown below.
+
+COMMENTS AND CANDIDATES
+=======================
+BLOCK_PLACEHOLDER\
+"""
+
+async def attach_literature(chs: list, lang: str) -> list:
+    """Attach verified references to the most serious comments.
+    Returns the de-duplicated list of works used (for the examiner report)."""
+    targets = [c for cs in chs for c in cs.comments
+               if c.severity in ("CRITICAL", "MODERATE") and c.search_query.strip()]
+    targets.sort(key=lambda c: c.severity != "CRITICAL")
+    targets = targets[:MAX_LIT_COMMENTS]
+    if not targets:
         return []
+
+    # One search per distinct query. Crossref's public pool allows little
+    # concurrency, so it is searched one query at a time; OpenAlex in parallel.
+    sem = asyncio.Semaphore(4 if OPENALEX_API_KEY else 1)
+    queries = list(dict.fromkeys(c.search_query.strip().lower() for c in targets))
+    async def fetch(q):
+        async with sem:
+            return q, await search_literature(q)
+    found = dict(await asyncio.gather(*(fetch(q) for q in queries)))
+    results = [found.get(c.search_query.strip().lower(), []) for c in targets]
+
+    blocks, candidates = [], {}
+    for i, (c, works) in enumerate(zip(targets, results)):
+        if not works:
+            continue
+        cid = f"c{i}"
+        lines = [f"[{cid}] ISSUE: {_shorten(c.issue, 400)}",
+                 f"      NEEDED: {_shorten(c.literature_needed, 200)}"]
+        for j, w in enumerate(works):
+            kid = f"{cid}-{j}"
+            candidates[kid] = (c, w)
+            lines.append(f"   ({kid}) {w['title']} ({w['year']}; {w['venue'] or 'n/a'}; cited {w['cited_by']}x)"
+                         f" — {_shorten(w['abstract'], 350) or 'no abstract'}")
+        blocks.append("\n".join(lines))
+    if not blocks:
+        print("[ThesisSifu] Literature: no search results")
+        return []
+
+    prompt = (_LIT_SELECT_PROMPT
+              .replace("LANG_PLACEHOLDER", _lang_instruction(lang))
+              .replace("BLOCK_PLACEHOLDER", "\n\n".join(blocks)))
+    d = await _gemini_json(prompt, "literature_selection")
+    used, seen = [], set()
+    for sel in (d or {}).get("selections", []) if isinstance(d, dict) else []:
+        for p in _flatten_to_list(sel.get("picks"))[:3]:
+            if not isinstance(p, dict) or p.get("candidate_id") not in candidates:
+                continue                      # ignore anything not actually retrieved
+            c, w = candidates[p["candidate_id"]]
+            if not p["candidate_id"].startswith(str(sel.get("comment_id", "")) + "-"):
+                continue                      # a pick must belong to its own comment
+            ref = {"citation": format_citation(w), "how_to_use": _flatten_to_str(p.get("how_to_use", ""))}
+            c.references.append(ref)
+            key = (w.get("doi") or w["title"]).lower()
+            if key not in seen:
+                seen.add(key)
+                used.append(ref["citation"])
+    print(f"[ThesisSifu] Literature: {sum(len(c.references) for c in targets)} references "
+          f"attached to {sum(1 for c in targets if c.references)}/{len(targets)} comments")
+    return used
 
 
 # ── Stage 3: Alignment Audit (Claude) ─────────────────────────
 _ALIGNMENT_SYSTEM = """\
-You are a senior academic examiner auditing STRUCTURAL ALIGNMENT of a thesis.
-Verify the golden thread: Problem -> RQ -> RO -> Theory -> Method -> Analysis -> Findings -> Conclusion.
-Return STRICT JSON only. No markdown, no prose outside the JSON.\
+You are a senior academic examiner auditing the STRUCTURAL ALIGNMENT (golden thread) of a thesis:
+Problem -> Gap -> RQ -> RO -> Hypothesis -> Theory/Constructs -> Design/Instrument -> Analysis
+-> Findings -> Discussion -> Conclusion/Contribution.
+You judge from the chapter digests, which record what each chapter actually commits to, with
+verbatim quotes. A link is only ALIGNED if the digests show it in BOTH chapters; if a later
+chapter never picks up what an earlier one promised (or the reverse), that is a break.
+Cite evidence as chapter + section + short quote. Be specific and fair: say what is aligned as
+well as what is broken.\
 """
 
+_ALIGNMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "rows": {"type": "array", "items": {
+            "type": "object",
+            "properties": {k: {"type": "string"} for k in (
+                "rq", "ro", "hypothesis", "theory_construct", "method", "instrument",
+                "analysis", "finding", "discussion", "conclusion", "broken_link",
+                "evidence", "note", "fix")} | {
+                "status": {"type": "string", "enum": ["ALIGNED", "PARTIAL", "MISALIGNED", "MISSING", "UNCLEAR"]}},
+            "required": ["rq", "ro", "hypothesis", "theory_construct", "method", "instrument",
+                         "analysis", "finding", "discussion", "conclusion", "status",
+                         "broken_link", "evidence", "note", "fix"],
+            "additionalProperties": False}},
+        "chapter_links": {"type": "array", "items": {
+            "type": "object",
+            "properties": {k: {"type": "string"} for k in (
+                "from_chapter", "to_chapter", "link", "evidence", "fix")} | {
+                "status": {"type": "string", "enum": ["ALIGNED", "PARTIAL", "MISALIGNED", "MISSING", "UNCLEAR"]}},
+            "required": ["from_chapter", "to_chapter", "link", "status", "evidence", "fix"],
+            "additionalProperties": False}},
+        "construct_consistency": {"type": "array", "items": {
+            "type": "object",
+            "properties": {k: {"type": "string"} for k in ("construct", "trace", "note")} | {
+                "status": {"type": "string", "enum": ["ALIGNED", "PARTIAL", "MISALIGNED", "MISSING", "UNCLEAR"]}},
+            "required": ["construct", "trace", "status", "note"],
+            "additionalProperties": False}},
+        "golden_thread_score": {"type": "string", "enum": ["STRONG", "ACCEPTABLE", "WEAK", "BROKEN"]},
+        "overall_verdict": {"type": "string"},
+        "critical_gaps": {"type": "array", "items": {"type": "string"}},
+        "structural_recommendations": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["rows", "chapter_links", "construct_consistency", "golden_thread_score",
+                 "overall_verdict", "critical_gaps", "structural_recommendations"],
+    "additionalProperties": False,
+}
+
+async def _claude_text(system: str, prompt: str, context: str,
+                       schema: Optional[dict] = None, max_tokens: int = 32000) -> str:
+    """One Claude call (streamed, so long outputs don't hit HTTP timeouts)."""
+    kwargs = dict(model=CLAUDE_MODEL, max_tokens=max_tokens, system=system,
+                  thinking={"type": "adaptive"},
+                  messages=[{"role": "user", "content": prompt}])
+    output_config = {"effort": CLAUDE_EFFORT}
+    if schema:
+        output_config["format"] = {"type": "json_schema", "schema": schema}
+    kwargs["output_config"] = output_config
+    async with claude_client.messages.stream(**kwargs) as stream:
+        msg = await stream.get_final_message()
+    if msg.stop_reason == "refusal":
+        raise RuntimeError(f"{context}: model declined the request")
+    if msg.stop_reason == "max_tokens":
+        print(f"[ThesisSifu] WARNING {context}: hit max_tokens, output may be truncated")
+    u = msg.usage
+    print(f"[ThesisSifu] {context}: in={u.input_tokens} out={u.output_tokens} stop={msg.stop_reason}")
+    return "".join(b.text for b in msg.content if b.type == "text").strip()
+
 _ALIGNMENT_PROMPT_TEMPLATE = """\
-THESIS SPINE
-============
+LANG_PLACEHOLDER
+
+THESIS SPINE (summary extracted from the thesis)
+================================================
 Title:                TITLE_PLACEHOLDER
 Discipline:           DISCIPLINE_PLACEHOLDER
 Problem statement:    PROBLEM_PLACEHOLDER
@@ -962,54 +1678,55 @@ Analysis technique:   ANALYSIS_PLACEHOLDER
 Key findings:         FINDINGS_PLACEHOLDER
 Conclusions:          CONCLUSIONS_PLACEHOLDER
 
-CRITICAL ISSUES RAISED BY SUBSECTION AUDIT
-==========================================
+CHAPTER DIGESTS (what each chapter actually commits to, with verbatim quotes)
+=============================================================================
+DIGESTS_PLACEHOLDER
+
+ISSUES RAISED BY THE SUBSECTION AUDIT
+=====================================
 CRITICAL_ISSUES_PLACEHOLDER
 
 YOUR TASK
 =========
-Produce a JSON object:
-{
-  "rows": [
-    {
-      "rq": "RQ1 verbatim",
-      "ro": "RO1 matched to RQ1",
-      "hypothesis": "H1 if applicable else none",
-      "method": "method used to answer RQ1",
-      "analysis": "analysis technique applied",
-      "finding": "finding relevant to RQ1",
-      "conclusion": "conclusion drawn for RQ1",
-      "status": "ALIGNED or PARTIAL or MISALIGNED or MISSING or UNCLEAR",
-      "note": "concrete reason — quote spine fields where possible"
-    }
-  ],
-  "golden_thread_score": "STRONG or ACCEPTABLE or WEAK or BROKEN",
-  "overall_verdict": "2-3 sentence verdict on structural coherence",
-  "critical_gaps": ["gap 1 with specific explanation", "gap 2"],
-  "structural_recommendations": ["specific fix 1 with named method/framework", "fix 2"]
-}
-
-Return ONLY the JSON object. No prose, no markdown.\
+1. rows — one row per research question (if there are no RQs, one per objective or hypothesis).
+   Trace it through every chapter: matching RO and hypothesis; the theory/construct behind it;
+   the method; the instrument items that measure its constructs; the analysis that answers it;
+   the finding reported for it; how the discussion interprets it; the conclusion drawn.
+   Use "NOT FOUND" for any link the digests do not show. Set status, name the first
+   broken_link (e.g. "RQ3 -> Ch4 findings: no result reported"), give evidence
+   (chapter, section, short quote), a note, and a concrete fix.
+2. chapter_links — check these links between chapters, each with status, evidence and fix:
+   Ch1 problem -> Ch1 gap; Ch1 gap -> Ch2 synthesis (does the review actually establish the gap?);
+   Ch2 theory -> hypotheses / conceptual framework; Ch2 constructs -> Ch3 instrument;
+   Ch3 analysis plan -> Ch4 analyses actually run; Ch4 findings -> Ch5 discussion (interpreted
+   against Ch2 literature and theory); Ch5 conclusions/contributions -> Ch1 objectives and significance.
+   Adapt chapter numbers to this thesis's structure.
+3. construct_consistency — for every key construct/variable: trace where it is defined, measured,
+   analysed and discussed (e.g. "Ch1 §1.6 defined; Ch2 §2.3 reviewed; Ch3 §3.5 measured (8 items);
+   Ch4 Table 4.7 tested; Ch5 not discussed"). Flag renamed, dropped or added constructs.
+4. golden_thread_score, overall_verdict (3-5 sentences), critical_gaps (most serious first,
+   each specific), structural_recommendations (each a concrete action; name frameworks or
+   methods with seminal authors where relevant).\
 """
 
-async def run_alignment_audit(spine: ThesisSpine, chs: list[ChapterSummary]) -> AlignmentMatrix:
+async def run_alignment_audit(spine: ThesisSpine, chs: list[ChapterSummary], lang: str) -> AlignmentMatrix:
     if not claude_client:
         return AlignmentMatrix(
             overall_verdict="Alignment audit unavailable — ANTHROPIC_API_KEY not set.",
             golden_thread_score="UNCLEAR")
-    critical_issues = []
-    for cs in chs:
-        for c in cs.comments:
-            if c.severity == "CRITICAL":
-                critical_issues.append(f"Ch.{c.chapter} §{c.subsection}: {c.issue}")
-    critical_block = "\n".join(critical_issues[:30]) or "(none)"
+    issues = [f"[{c.severity}] {c.chapter} §{c.subsection}"
+              f"{' (' + c.golden_thread_link + ')' if c.golden_thread_link else ''}: {_shorten(c.issue, 300)}"
+              for cs in chs for c in cs.comments if c.severity in ("CRITICAL", "MODERATE")]
+    issues.sort(key=lambda s: not s.startswith("[CRITICAL]"))
+    issue_block = "\n".join(issues[:60]) or "(none)"
 
     prompt = (
         _ALIGNMENT_PROMPT_TEMPLATE
+        .replace("LANG_PLACEHOLDER",        _lang_instruction(lang))
         .replace("TITLE_PLACEHOLDER",       spine.title)
         .replace("DISCIPLINE_PLACEHOLDER",  spine.discipline)
-        .replace("PROBLEM_PLACEHOLDER",     spine.problem_statement[:400])
-        .replace("GAP_PLACEHOLDER",         spine.research_gap[:300])
+        .replace("PROBLEM_PLACEHOLDER",     spine.problem_statement[:600])
+        .replace("GAP_PLACEHOLDER",         spine.research_gap[:400])
         .replace("RQS_PLACEHOLDER",         "; ".join(spine.research_questions) or "NOT FOUND")
         .replace("ROS_PLACEHOLDER",         "; ".join(spine.research_objectives) or "NOT FOUND")
         .replace("HYPS_PLACEHOLDER",        "; ".join(spine.hypotheses) or "NOT FOUND")
@@ -1021,32 +1738,29 @@ async def run_alignment_audit(spine: ThesisSpine, chs: list[ChapterSummary]) -> 
         .replace("ANALYSIS_PLACEHOLDER",    spine.analysis_technique)
         .replace("FINDINGS_PLACEHOLDER",    "; ".join(spine.key_findings) or "NOT FOUND")
         .replace("CONCLUSIONS_PLACEHOLDER", "; ".join(spine.conclusions) or "NOT FOUND")
-        .replace("CRITICAL_ISSUES_PLACEHOLDER", critical_block)
+        .replace("DIGESTS_PLACEHOLDER",     digests_block(chs))
+        .replace("CRITICAL_ISSUES_PLACEHOLDER", issue_block)
     )
     try:
-        msg = await claude_client.messages.create(
-            model="claude-haiku-4-5", max_tokens=2048, temperature=0.2,
-            system=_ALIGNMENT_SYSTEM,
-            messages=[{"role":"user","content":prompt}])
-        raw = msg.content[0].text.strip()
-        raw = re.sub(r"```(?:json)?","", raw).strip("`").strip()
-        d = json.loads(raw)
-        rows = [AlignmentRow(
-            rq=        r.get("rq","—"),         ro=       r.get("ro","—"),
-            hypothesis=r.get("hypothesis","—"),  method=   r.get("method","—"),
-            analysis=  r.get("analysis","—"),    finding=  r.get("finding","—"),
-            conclusion=r.get("conclusion","—"),
-            status=    str(r.get("status","UNCLEAR")).upper(),
-            note=      r.get("note",""))
-            for r in d.get("rows",[])]
+        d = _parse_json_loose(await _claude_text(_ALIGNMENT_SYSTEM, prompt, "alignment_audit",
+                                                 schema=_ALIGNMENT_SCHEMA))
+        rows = [AlignmentRow(**{k: _flatten_to_str(r.get(k, "—")) for k in (
+                    "rq", "ro", "hypothesis", "theory_construct", "method", "instrument",
+                    "analysis", "finding", "discussion", "conclusion", "broken_link",
+                    "evidence", "note", "fix")},
+                    status=str(r.get("status", "UNCLEAR")).upper())
+                for r in d.get("rows", []) if isinstance(r, dict)]
         matrix = AlignmentMatrix(
             rows=rows,
-            overall_verdict=            d.get("overall_verdict",""),
+            overall_verdict=            _flatten_to_str(d.get("overall_verdict","")),
             golden_thread_score=        str(d.get("golden_thread_score","UNCLEAR")).upper(),
-            critical_gaps=              d.get("critical_gaps",[]),
-            structural_recommendations= d.get("structural_recommendations",[]),
+            critical_gaps=              [_flatten_to_str(g) for g in _flatten_to_list(d.get("critical_gaps"))],
+            structural_recommendations= [_flatten_to_str(g) for g in _flatten_to_list(d.get("structural_recommendations"))],
+            chapter_links=              [x for x in _flatten_to_list(d.get("chapter_links")) if isinstance(x, dict)],
+            construct_consistency=      [x for x in _flatten_to_list(d.get("construct_consistency")) if isinstance(x, dict)],
         )
-        print(f"[ThesisSifu] Alignment audit: {len(rows)} rows, score={matrix.golden_thread_score}")
+        print(f"[ThesisSifu] Alignment audit: {len(rows)} rows, {len(matrix.chapter_links)} links, "
+              f"{len(matrix.construct_consistency)} constructs, score={matrix.golden_thread_score}")
         return matrix
     except json.JSONDecodeError as e:
         print(f"[ThesisSifu] Alignment JSON parse error: {e}")
@@ -1059,11 +1773,28 @@ async def run_alignment_audit(spine: ThesisSpine, chs: list[ChapterSummary]) -> 
 # ── Stage 4: Holistic Examiner (Claude) ───────────────────────
 _EXAMINER_SYSTEM = """\
 You are a senior academic examiner with 25 years of experience.
-Produce rigorous, specific, honest examiner-level critique anchored to the
-provided thesis spine and alignment matrix. You are NOT a grammar checker —
-you are an intellectual critic. Cite specific spine fields when you make claims.
-Recommend named frameworks (with seminal author) where appropriate.
-Respond in the same language as the document.\
+Produce rigorous, specific, honest examiner-level critique anchored to the provided thesis
+spine, alignment audit and chapter issues. You are an intellectual critic, not a grammar checker.
+
+For every weakness you raise:
+  1. Locate it (chapter / section) and state the evidence (short quote or precise paraphrase).
+  2. Explain why an examiner would object — which part of the golden thread or validity it harms.
+  3. Give a concrete fix: what to add, remove or restructure, with an example sentence, table
+     structure or analysis step where useful.
+  4. Support it with literature: cite ONLY works from VERIFIED LITERATURE or the CANONICAL
+     LIBRARIES (author, year). Never invent a reference, title or DOI.
+Acknowledge genuine strengths briefly where they are earned.
+Keep every section heading on its own line in the exact form "SECTION N — TITLE".\
+"""
+
+_EXAMINER_LANG_MS = """\
+Write the whole report in formal academic Bahasa Melayu (DBP spelling and istilah). Keep the
+word "SECTION" and its number in each heading but translate the title, e.g.
+"SECTION 2 — ANALISIS BENANG EMAS". In the verdict section, state the outcome using the exact
+English label listed, followed by its Bahasa Melayu translation in brackets. In the language
+and tone section, assess formal academic Bahasa Melayu: DBP spelling and terminology,
+consistent rendering of English technical terms (English term in brackets at first use), and
+avoidance of code-mixing and colloquial language.\
 """
 
 _PHD_EXAMINER = """\
@@ -1099,7 +1830,8 @@ Write a full examiner report with EXACTLY these sections:
 
 SECTION 1 — ORIGINAL CONTRIBUTION TO KNOWLEDGE
 SECTION 2 — GOLDEN THREAD ANALYSIS
-Use the alignment matrix. Quote spine fields. Identify exact broken links.
+Use the alignment audit detail. Trace each research question from Chapter 1 to the conclusion;
+for each broken or partial link name the chapters involved, the evidence, and the fix.
 SECTION 3 — CHAPTER + SUBSECTION ALIGNMENT AUDIT
 For each chapter, list which subsections under-delivered on expected purpose.
 SECTION 4 — THEORETICAL FRAMEWORK COHERENCE
@@ -1148,6 +1880,8 @@ METHODS_PLACEHOLDER
 Write a report with EXACTLY these sections:
 
 SECTION 1 — THESIS ALIGNMENT & GOLDEN THREAD
+Use the alignment audit detail: for each broken or partial link name the chapters involved,
+the evidence, and the fix. Trace each research question from Chapter 1 to the conclusion.
 SECTION 2 — CHAPTER + SUBSECTION ALIGNMENT AUDIT
 SECTION 3 — THEORETICAL FRAMEWORK (recommend named theory + seminal author)
 SECTION 4 — METHODOLOGICAL RIGOUR (recommend named method + seminal author)
@@ -1246,10 +1980,11 @@ _EXAMINER_TEMPLATES = {
 }
 
 async def run_examiner(doc_type: str, spine: ThesisSpine, field: str, inst: str,
-                       chs: list[ChapterSummary], align: AlignmentMatrix) -> str:
+                       chs: list[ChapterSummary], align: AlignmentMatrix,
+                       verified_refs: list, lang: str) -> str:
     if not claude_client:
         return "Examiner synthesis unavailable — ANTHROPIC_API_KEY not set."
-    # Build compact summaries — only critical issues per chapter, capped tightly
+    # Per-chapter issue summary: critical + moderate, with their golden-thread links
     summaries = ""
     for cs in chs:
         n_c = sum(1 for c in cs.comments if c.severity=="CRITICAL")
@@ -1259,15 +1994,39 @@ async def run_examiner(doc_type: str, spine: ThesisSpine, field: str, inst: str,
         summaries += (f"\nCh.{cs.chapter_num} — {cs.chapter_title}: "
                       f"{len(cs.comments)} comments (C:{n_c} M:{n_m})\n")
         for sub in cs.subsections:
-            crit = [c for c in sub.comments if c.severity=="CRITICAL"]
-            if crit:
+            top = ([c for c in sub.comments if c.severity=="CRITICAL"][:2] +
+                   [c for c in sub.comments if c.severity=="MODERATE"][:1])
+            if top:
                 summaries += f"  §{sub.subsection_num} {sub.title[:50]}\n"
-                for c in crit[:2]:   # max 2 critical per subsection
-                    summaries += f"    • {c.issue[:120]}\n"
-    summaries = summaries[:4000]   # hard cap down from 8000
+                for c in top:
+                    link = f" [{c.golden_thread_link}]" if c.golden_thread_link else ""
+                    summaries += f"    • ({c.severity}){link} {_shorten(c.issue, 220)}\n"
+    summaries = summaries[:12000]
 
-    gaps = "\n".join(f"  * {g[:120]}" for g in align.critical_gaps[:5]) or "  (none)"
+    gaps = "\n".join(f"  * {g[:300]}" for g in align.critical_gaps[:8]) or "  (none)"
     template = _EXAMINER_TEMPLATES.get(doc_type, _MASTERS_EXAMINER)
+
+    align_detail = []
+    for r in align.rows:
+        align_detail.append(f"  - [{r.status}] {_shorten(r.rq, 140)}"
+                            + (f" | broken: {_shorten(r.broken_link, 160)}" if r.broken_link else "")
+                            + (f" | evidence: {_shorten(r.evidence, 200)}" if r.evidence else ""))
+    for x in align.chapter_links:
+        if str(x.get("status", "")).upper() != "ALIGNED":
+            align_detail.append(f"  - [{x.get('status')}] {x.get('from_chapter')} -> {x.get('to_chapter')}: "
+                                f"{_shorten(str(x.get('link','')), 120)} | {_shorten(str(x.get('evidence','')), 200)}")
+    for x in align.construct_consistency:
+        if str(x.get("status", "")).upper() != "ALIGNED":
+            align_detail.append(f"  - [{x.get('status')}] construct '{x.get('construct')}': "
+                                f"{_shorten(str(x.get('trace','')), 200)}")
+    refs = "\n".join(f"  - {r}" for r in verified_refs[:40]) or "  (none retrieved)"
+    extra = ("ALIGNMENT AUDIT DETAIL (from the cross-chapter golden-thread audit)\n"
+             "===================================================================\n"
+             + ("\n".join(align_detail)[:8000] or "  (no detail)") +
+             "\n\nVERIFIED LITERATURE (real, retrieved records — the only new works you may cite)\n"
+             "================================================================================\n"
+             + refs + "\n\n" + _lang_instruction(lang)
+             + ("\n" + _EXAMINER_LANG_MS if lang == "ms" else ""))
     prompt = (
         template
         .replace("TITLE_PLACEHOLDER",        spine.title[:150])
@@ -1280,20 +2039,17 @@ async def run_examiner(doc_type: str, spine: ThesisSpine, field: str, inst: str,
         .replace("METHOD_PLACEHOLDER",        spine.methodology[:100])
         .replace("ANALYSIS_PLACEHOLDER",      spine.analysis_technique[:100])
         .replace("GT_SCORE_PLACEHOLDER",      align.golden_thread_score)
-        .replace("ALIGN_VERDICT_PLACEHOLDER", align.overall_verdict[:300])
+        .replace("ALIGN_VERDICT_PLACEHOLDER", align.overall_verdict[:1200])
         .replace("GAPS_PLACEHOLDER",          gaps)
         .replace("SUMMARIES_PLACEHOLDER",     summaries)
         .replace("FRAMEWORKS_PLACEHOLDER",    CANONICAL_FRAMEWORKS)
         .replace("METHODS_PLACEHOLDER",       CANONICAL_METHODS)
     )
+    # Every template ends with its "Write a ... with EXACTLY these sections" instruction;
+    # the alignment detail and verified literature go just before it.
+    prompt = prompt.replace("\nWrite a", "\n" + extra + "\n\nWrite a", 1)
     try:
-        msg = await claude_client.messages.create(
-            model="claude-haiku-4-5",   # 3-5x faster than Sonnet; still excellent for structured reports
-            max_tokens=4096,            # reduced from 8192 — enough for a complete report
-            temperature=0.3,
-            system=_EXAMINER_SYSTEM,
-            messages=[{"role":"user","content":prompt}])
-        return msg.content[0].text.strip()
+        return await _claude_text(_EXAMINER_SYSTEM, prompt, "examiner_report")
     except Exception as e:
         print(f"[ThesisSifu] Examiner error: {e}\n{traceback.format_exc()}")
         return f"Examiner synthesis failed: {e}"
@@ -1353,8 +2109,8 @@ def vbanner(S, text, color, subtitle="Examiner's Recommended Outcome"):
         ("LEFTPADDING",(0,0),(-1,-1),16),("RIGHTPADDING",(0,0),(-1,-1),16)]))
     return t
 
-def sev_badge(S, sev, count):
-    t = Table([[Paragraph(f"{sev}: {count}",S["Badge"])]],colWidths=[3.5*cm])
+def sev_badge(S, sev, count, lang="en"):
+    t = Table([[Paragraph(f"{sev_label(sev, lang)}: {count}",S["Badge"])]],colWidths=[3.5*cm])
     t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),SEV_COLORS.get(sev,ACCENT)),
         ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
         ("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8)]))
@@ -1367,24 +2123,27 @@ def type_badge_table(S, text, color):
         ("LEFTPADDING",(0,0),(-1,-1),12),("RIGHTPADDING",(0,0),(-1,-1),12)]))
     return t
 
-def spine_box(S, spine: ThesisSpine):
-    rows = [
-        ("Title",              spine.title[:120]),
-        ("Discipline",         spine.discipline),
-        ("Problem Statement",  spine.problem_statement[:300]),
-        ("Research Gap",       spine.research_gap[:250]),
-        ("Research Questions", "; ".join(spine.research_questions[:6]) or "NOT FOUND"),
-        ("Research Objectives","; ".join(spine.research_objectives[:6]) or "NOT FOUND"),
-        ("Theory Used",        spine.theory_used),
-        ("Variables",          "; ".join(spine.variables[:10]) or "NOT FOUND"),
-        ("Methodology",        spine.methodology),
-        ("Sampling",           spine.sampling),
-        ("Instrument",         spine.instrument),
-        ("Analysis Technique", spine.analysis_technique),
-        ("Key Findings",       "; ".join(spine.key_findings[:4]) or "NOT FOUND"),
-        ("Conclusions",        "; ".join(spine.conclusions[:4]) or "NOT FOUND"),
+_SPINE_KEYS = [
+    ("Title", "Tajuk"), ("Discipline", "Bidang"), ("Problem Statement", "Pernyataan Masalah"),
+    ("Research Gap", "Jurang Kajian"), ("Research Questions", "Persoalan Kajian"),
+    ("Research Objectives", "Objektif Kajian"), ("Theory Used", "Teori"),
+    ("Variables", "Pemboleh Ubah"), ("Methodology", "Metodologi"), ("Sampling", "Persampelan"),
+    ("Instrument", "Instrumen"), ("Analysis Technique", "Teknik Analisis"),
+    ("Key Findings", "Dapatan Utama"), ("Conclusions", "Kesimpulan"),
+]
+
+def spine_box(S, spine: ThesisSpine, lang: str = "en"):
+    vals = [
+        spine.title[:120], spine.discipline, spine.problem_statement[:300], spine.research_gap[:250],
+        "; ".join(spine.research_questions[:6]) or "NOT FOUND",
+        "; ".join(spine.research_objectives[:6]) or "NOT FOUND",
+        spine.theory_used, "; ".join(spine.variables[:10]) or "NOT FOUND",
+        spine.methodology, spine.sampling, spine.instrument, spine.analysis_technique,
+        "; ".join(spine.key_findings[:4]) or "NOT FOUND",
+        "; ".join(spine.conclusions[:4]) or "NOT FOUND",
     ]
-    data = [[Paragraph(k,S["SpineK"]), Paragraph(str(v),S["SpineV"])] for k,v in rows]
+    rows = [(ms if lang == "ms" else en, v) for (en, ms), v in zip(_SPINE_KEYS, vals)]
+    data = [[Paragraph(k,S["SpineK"]), _safe_para(str(v),S["SpineV"])] for k,v in rows]
     return _tbl(data,[4.5*cm,W-5*cm-4.5*cm],[
         ("BACKGROUND",(0,0),(-1,-1),BOX_BG),("BOX",(0,0),(-1,-1),.5,RULE),
         ("INNERGRID",(0,0),(-1,-1),.3,RULE),("TOPPADDING",(0,0),(-1,-1),4),
@@ -1392,7 +2151,7 @@ def spine_box(S, spine: ThesisSpine):
         ("RIGHTPADDING",(0,0),(-1,-1),8),("VALIGN",(0,0),(-1,-1),"TOP")])
 
 def parse_secs(text):
-    pat = re.compile(r'(?:^|\n)\s*(?:\*{0,2})?SECTION\s+\d+\s*[—–\-]+\s*([^\n*]+?)(?:\*{0,2})?\s*\n',re.IGNORECASE)
+    pat = re.compile(r'(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*{0,2})?(?:SECTION|SEKSYEN|BAHAGIAN)\s+\d+\s*[—–\-:]+\s*([^\n*]+?)(?:\*{0,2})?\s*\n',re.IGNORECASE)
     ms  = list(pat.finditer(text))
     if not ms: return [{"title":"Full Report","body":text.strip()}]
     out = []
@@ -1402,14 +2161,24 @@ def parse_secs(text):
         out.append({"title":t,"body":text[s:e].strip()})
     return out
 
+_VERDICTS = [
+    ("READY FOR SUBMISSION", GREEN), ("PASS WITH MINOR CORRECTIONS", AMBER),
+    ("MINOR REVISIONS REQUIRED", AMBER), ("MINOR REVISIONS", AMBER),
+    ("MAJOR REVISIONS REQUIRED", RED), ("MAJOR REVISIONS", RED),
+    ("REFER (RESUBMIT)", RED), ("REJECT AND REWRITE", RED), ("REJECT", RED),
+    ("RESUBMIT", RED), ("FAIL", RED), ("ACCEPT", GREEN), ("PASS", GREEN),
+]
+
 def detect_verdict(text):
-    u = text.upper()
-    for lbl,col in [("READY FOR SUBMISSION",GREEN),("ACCEPT",GREEN),
-                    ("PASS WITH MINOR CORRECTIONS",AMBER),("MINOR REVISIONS REQUIRED",AMBER),
-                    ("MAJOR REVISIONS REQUIRED",RED),("REFER (RESUBMIT)",RED),
-                    ("REJECT AND REWRITE",RED),("REJECT",RED),("RESUBMIT",RED),
-                    ("FAIL",RED),("PASS",GREEN)]:
-        if lbl in u: return lbl.title(), col
+    """Find the verdict label in the verdict (last) section only, as a whole word.
+    Searching the whole report matched words like "acceptable" or "pass" in
+    ordinary sentences and showed the wrong banner."""
+    secs = parse_secs(text)
+    scope = secs[-1]["body"] if secs else text
+    u = scope.upper()
+    for lbl, col in _VERDICTS:
+        if re.search(r'(?<![A-Z])' + re.escape(lbl) + r'(?![A-Z])', u):
+            return lbl.title(), col
     return "Review Complete", ACCENT
 
 def _safe_para(text: str, style) -> "Paragraph":
@@ -1461,21 +2230,27 @@ def body2story(S, body):
             items.append(_safe_para(line, S["Body"]))
     return items
 
-def _comment_text(c: ParagraphComment) -> str:
-    sev = {"CRITICAL":"[CRITICAL]","MODERATE":"[MODERATE]",
-           "SUGGESTION":"[SUGGESTION]"}.get(c.severity,"[NOTE]")
-    fw  = f"\n\nSUGGESTED FRAMEWORK: {c.suggested_framework}" if c.suggested_framework else ""
-    mt  = f"\n\nSUGGESTED METHOD: {c.suggested_method}" if c.suggested_method else ""
-    return (f"{sev} ThesisSifu v4 — §{c.subsection} {c.subsection_title}\n\n"
-            f"ISSUE: {c.issue}\n\n"
-            f"RECOMMENDATION: {c.recommendation}\n\n"
-            f"LITERATURE NEEDED: {c.literature_needed}\n\n"
-            f"THEORY/FRAMEWORK: {c.theory_needed}"
-            f"{fw}{mt}")
+def _comment_text(c: ParagraphComment, lang: str = "en") -> str:
+    sev = f"[{sev_label(c.severity, lang)}]"
+    up  = lambda k: L(k, lang).upper()
+    gt  = f"\n\n{up('thread_link')}: {c.golden_thread_link}" if c.golden_thread_link else ""
+    fw  = f"\n\n{up('framework')}: {c.suggested_framework}" if c.suggested_framework else ""
+    mt  = f"\n\n{up('method')}: {c.suggested_method}" if c.suggested_method else ""
+    refs = ""
+    if c.references:
+        refs = f"\n\n{up('verified_refs')}:" + "".join(
+            f"\n• {r['citation']}" + (f" — {r['how_to_use']}" if r.get("how_to_use") else "")
+            for r in c.references)
+    return (f"{sev} ThesisSifu Pro — §{c.subsection} {c.subsection_title}\n\n"
+            f"{up('issue')}: {c.issue}{gt}\n\n"
+            f"{up('recommendation')}: {c.recommendation}\n\n"
+            f"{up('literature')}: {c.literature_needed}\n\n"
+            f"{up('theory')}: {c.theory_needed}"
+            f"{fw}{mt}{refs}")
 
 
 # ── Output 1: Examiner Report PDF ─────────────────────────────
-def build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, align, chs) -> bytes:
+def build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, align, chs, lang="en") -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf,pagesize=A4,leftMargin=2.5*cm,rightMargin=2.5*cm,
                             topMargin=2.2*cm,bottomMargin=2.2*cm)
@@ -1484,8 +2259,8 @@ def build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, 
     type_label = TYPE_LABELS.get(doc_type,doc_type)
     story.append(type_badge_table(S,type_label.upper(),TYPE_COLORS.get(doc_type,NAVY)))
     story.append(Spacer(1,14))
-    story.append(Paragraph("EXAMINER'S AUDIT REPORT",S["Title"]))
-    story.append(Paragraph("ThesisSifu Pro v4.1 — Alignment-Aware Multi-Agent Panel",S["Sub"]))
+    story.append(Paragraph(L("examiner_title", lang),S["Title"]))
+    story.append(Paragraph("ThesisSifu Pro v4.2 — Alignment-Aware Multi-Agent Panel",S["Sub"]))
     story.append(HR(c=NAVY,t=1.5,b=4,a=10))
 
     au=clf.get("authors","UNKNOWN"); fi=clf.get("field","UNKNOWN"); ins=clf.get("institution","UNKNOWN")
@@ -1499,17 +2274,17 @@ def build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, 
     ]))
     story.append(Spacer(1,10))
 
-    story.append(Paragraph("EXTRACTED THESIS SPINE",S["SecHead"]))
+    story.append(Paragraph(L("spine", lang),S["SecHead"]))
     story.append(HR(c=NAVY,t=1,b=0,a=6))
-    story.append(spine_box(S, spine))
+    story.append(spine_box(S, spine, lang))
     story.append(Spacer(1,10))
 
     nc=sum(1 for cs in chs for c in cs.comments if c.severity=="CRITICAL")
     nm=sum(1 for cs in chs for c in cs.comments if c.severity=="MODERATE")
     ns=sum(1 for cs in chs for c in cs.comments if c.severity=="SUGGESTION")
-    brow = Table([[sev_badge(S,"CRITICAL",nc),Spacer(6,1),
-                   sev_badge(S,"MODERATE",nm),Spacer(6,1),
-                   sev_badge(S,"SUGGESTION",ns)]],
+    brow = Table([[sev_badge(S,"CRITICAL",nc,lang),Spacer(6,1),
+                   sev_badge(S,"MODERATE",nm,lang),Spacer(6,1),
+                   sev_badge(S,"SUGGESTION",ns,lang)]],
                  colWidths=[3.5*cm,.5*cm,3.5*cm,.5*cm,3.5*cm])
     brow.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE"),
         ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0)]))
@@ -1517,10 +2292,10 @@ def build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, 
 
     gt = align.golden_thread_score
     gt_color = {"STRONG":GREEN,"ACCEPTABLE":AMBER,"WEAK":RED,"BROKEN":RED}.get(gt, ACCENT)
-    story.append(vbanner(S,f"Golden Thread: {gt}",gt_color,subtitle="Structural Alignment Score"))
+    story.append(vbanner(S,f"{L('golden_thread', lang)}: {gt}",gt_color,subtitle=L("align_score_sub", lang)))
     story.append(Spacer(1,8))
     vl,vc = detect_verdict(examiner_text)
-    story.append(vbanner(S,vl,vc)); story.append(Spacer(1,10)); story.append(HR())
+    story.append(vbanner(S,vl,vc,subtitle=L("verdict_sub", lang))); story.append(Spacer(1,10)); story.append(HR())
 
     for sec in parse_secs(examiner_text):
         bl = [Paragraph(sec["title"].upper(),S["SecHead"]),HR(c=ACCENT,t=.7,b=0,a=6)]
@@ -1528,7 +2303,7 @@ def build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, 
         story.append(KeepTogether(bl[:3])); story.extend(bl[3:])
 
     story.append(PageBreak())
-    story.append(Paragraph("CHAPTER + SUBSECTION ISSUE SUMMARY",S["SecHead"]))
+    story.append(Paragraph(L("issue_summary", lang),S["SecHead"]))
     story.append(HR(c=NAVY,t=1,b=0,a=8))
     td = [[Paragraph(h,S["TblH"]) for h in ["Chapter / Subsection","Critical","Moderate","Suggestions","Total"]]]
     for cs in chs:
@@ -1555,7 +2330,7 @@ def build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, 
         ("RIGHTPADDING",(0,0),(-1,-1),5),("VALIGN",(0,0),(-1,-1),"TOP")]))
     story.append(t)
     story.append(Spacer(1,20)); story.append(HR())
-    story.append(Paragraph("ThesisSifu Pro v4.1 — See Report 2 (Annotated Thesis), "
+    story.append(Paragraph("ThesisSifu Pro v4.2 — See Report 2 (Annotated Thesis), "
         "Report 3 (Commentary Log), Report 4 (Alignment Matrix) in this ZIP.",S["Footer"]))
     doc.build(story); buf.seek(0); return buf.getvalue()
 
@@ -1590,7 +2365,7 @@ def _insert_comment(doc, para, cid, author, text, date_str):
     rpr.append(rs); rr.append(rpr)
     cr  = OxmlElement('w:commentReference'); cr.set(qn('w:id'),str(cid)); rr.append(cr); px.append(rr)
 
-def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
+def build_annotated_docx(content, filename, audit_id, chs, clf, lang="en") -> bytes:
     doc = DocxDocument(io.BytesIO(content))
     date_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
     cp = _get_or_create_comments_part(doc)
@@ -1620,7 +2395,7 @@ def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
                 if id(c) in matched: continue
                 matched.add(id(c))
                 try:
-                    _insert_comment(doc, para, cid, "ThesisSifu v4", _comment_text(c), date_str)
+                    _insert_comment(doc, para, cid, "ThesisSifu Pro", _comment_text(c, lang), date_str)
                     cid += 1
                 except Exception as e:
                     print(f"[ThesisSifu] DOCX comment insert error {cid}: {e}")
@@ -1628,13 +2403,13 @@ def build_annotated_docx(content, filename, audit_id, chs, clf) -> bytes:
 
     hdr = doc.sections[0].header
     if hdr.paragraphs:
-        hdr.paragraphs[0].text = (f"ThesisSifu Pro v4 | Annotated Thesis | "
+        hdr.paragraphs[0].text = (f"ThesisSifu Pro v4.2 | Annotated Thesis | "
                                    f"Audit ID: {audit_id} | {datetime.now().strftime('%d %B %Y')}")
     buf = io.BytesIO(); doc.save(buf); buf.seek(0); return buf.getvalue()
 
 
 # ── Output 2 (PDF): Annotated PDF (Sticky Notes) ─────────────
-def build_annotated_pdf(content: bytes, full_text: str, audit_id: str, chs: list) -> bytes:
+def build_annotated_pdf(content: bytes, full_text: str, audit_id: str, chs: list, lang: str = "en") -> bytes:
     """Place sticky-note annotations on the PDF.
 
     PDF TEXT SEARCH LIMITATION: Many thesis PDFs use Identity-H CID TrueType fonts
@@ -1657,7 +2432,7 @@ def build_annotated_pdf(content: bytes, full_text: str, audit_id: str, chs: list
     print(f"[ThesisSifu] Placing {len(all_comments)} PDF annotations (position-based)")
 
     for c in all_comments:
-        txt = _comment_text(c)
+        txt = _comment_text(c, lang)
 
         # Determine target page (0-indexed, clamped)
         pg = max(0, min(c.page_estimate - 1, total_pages - 1))
@@ -1728,16 +2503,16 @@ def build_annotated_pdf(content: bytes, full_text: str, audit_id: str, chs: list
 
 
 # ── Output 3: Commentary Report PDF ───────────────────────────
-def build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs) -> bytes:
+def build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs, lang="en") -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf,pagesize=A4,leftMargin=2.5*cm,rightMargin=2.5*cm,
                             topMargin=2.2*cm,bottomMargin=2.2*cm)
     S = pdf_styles(); story = []
 
-    story.append(type_badge_table(S,"PARAGRAPH-LEVEL COMMENTARY REPORT",TYPE_COLORS.get(doc_type,NAVY)))
+    story.append(type_badge_table(S,L("commentary_badge", lang),TYPE_COLORS.get(doc_type,NAVY)))
     story.append(Spacer(1,14))
-    story.append(Paragraph("COMMENTARY REPORT",S["Title"]))
-    story.append(Paragraph("ThesisSifu Pro v4.1 — Subsection-Level Supervisor Notes",S["Sub"]))
+    story.append(Paragraph(L("commentary_title", lang),S["Title"]))
+    story.append(Paragraph("ThesisSifu Pro v4.2 — " + L("commentary_sub", lang),S["Sub"]))
     story.append(HR(c=NAVY,t=1.5,b=4,a=10))
 
     au = clf.get("authors","UNKNOWN")
@@ -1755,7 +2530,7 @@ def build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs) -> bytes
     nm = sum(1 for c in all_c if c.severity=="MODERATE")
     ns = sum(1 for c in all_c if c.severity=="SUGGESTION")
 
-    story.append(Paragraph("OVERALL COMMENT DISTRIBUTION",S["SecHead"]))
+    story.append(Paragraph(L("distribution", lang),S["SecHead"]))
     cw = W-5*cm
     td = [[Paragraph(h,S["TblH"]) for h in ["Severity","Count","Description"]],
           [Paragraph("CRITICAL",S["TblC"]),Paragraph(str(nc),S["TblC"]),
@@ -1789,13 +2564,13 @@ def build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs) -> bytes
             for sub in cs.subsections:
                 if not sub.comments: continue
                 story.append(Paragraph(f"§{sub.subsection_num} — {sub.title}",S["SubHead"]))
-                story.append(Paragraph(f"<i>Expected purpose: {sub.expected_purpose}</i>",S["Excerpt"]))
+                story.append(_safe_para(f"<i>{L('expected', lang)}: {sub.expected_purpose}</i>",S["Excerpt"]))
                 story.append(Spacer(1,4))
 
                 for i, c in enumerate(sub.comments,1):
                     sc = SEV_COLORS.get(c.severity,ACCENT)
                     hdr_row = Table(
-                        [[Paragraph(c.severity,S["Badge"]),Spacer(6,1),
+                        [[Paragraph(sev_label(c.severity, lang),S["Badge"]),Spacer(6,1),
                           Paragraph(f"§{sub.subsection_num} Comment {i} | Page ~{c.page_estimate}",S["Meta"])]],
                         colWidths=[2.2*cm,.4*cm,W-5*cm-2.6*cm])
                     hdr_row.setStyle(TableStyle([("BACKGROUND",(0,0),(0,0),sc),
@@ -1810,15 +2585,24 @@ def build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs) -> bytes
                     excerpt_box.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),LGRAY),
                         ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
                         ("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8)]))
-                    fw_line = f'<br/><br/><b>Suggested framework:</b> {c.suggested_framework}' if c.suggested_framework else ""
-                    mt_line = f'<br/><br/><b>Suggested method/reference:</b> {c.suggested_method}' if c.suggested_method else ""
+                    esc = lambda x: str(x).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+                    gt_line = (f'<br/><br/><b>{L("thread_link", lang)}:</b> {esc(c.golden_thread_link)}'
+                               if c.golden_thread_link else "")
+                    fw_line = f'<br/><br/><b>{L("framework", lang)}:</b> {esc(c.suggested_framework)}' if c.suggested_framework else ""
+                    mt_line = f'<br/><br/><b>{L("method", lang)}:</b> {esc(c.suggested_method)}' if c.suggested_method else ""
+                    ref_line = ""
+                    if c.references:
+                        ref_line = f'<br/><br/><b>{L("verified_refs", lang)}:</b>' + "".join(
+                            f'<br/>• {esc(r["citation"])}'
+                            + (f' <i>— {esc(r["how_to_use"])}</i>' if r.get("how_to_use") else "")
+                            for r in c.references)
                     detail_box = Table(
                         [[_safe_para(
-                            f'<b>Issue:</b> {c.issue}<br/><br/>'
-                            f'<b>Recommendation:</b> {c.recommendation}<br/><br/>'
-                            f'<b>Literature needed:</b> {c.literature_needed}<br/><br/>'
-                            f'<b>Theory / Framework:</b> {c.theory_needed}'
-                            f'{fw_line}{mt_line}',S["Detail"])]],
+                            f'<b>{L("issue", lang)}:</b> {esc(c.issue)}{gt_line}<br/><br/>'
+                            f'<b>{L("recommendation", lang)}:</b> {esc(c.recommendation)}<br/><br/>'
+                            f'<b>{L("literature", lang)}:</b> {esc(c.literature_needed)}<br/><br/>'
+                            f'<b>{L("theory", lang)}:</b> {esc(c.theory_needed)}'
+                            f'{fw_line}{mt_line}{ref_line}',S["Detail"])]],
                         colWidths=[W-5*cm])
                     detail_box.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),BOX_BG),
                         ("BOX",(0,0),(-1,-1),.4,RULE),("TOPPADDING",(0,0),(-1,-1),7),
@@ -1829,23 +2613,23 @@ def build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs) -> bytes
             story.append(Spacer(1,12)); story.append(HR())
 
     story.append(Spacer(1,6))
-    story.append(Paragraph("ThesisSifu Pro v4.1 — Subsection commentary. "
+    story.append(Paragraph("ThesisSifu Pro v4.2 — Subsection commentary. "
         "See Report 1 (Examiner Audit), Report 2 (Annotated Thesis), "
         "Report 4 (Alignment Matrix).",S["Footer"]))
     doc.build(story); buf.seek(0); return buf.getvalue()
 
 
 # ── Output 4: Alignment Matrix Report PDF ─────────────────────
-def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) -> bytes:
+def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs, lang="en") -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf,pagesize=A4,leftMargin=2*cm,rightMargin=2*cm,
                             topMargin=2.2*cm,bottomMargin=2.2*cm)
     S = pdf_styles(); story = []
 
-    story.append(type_badge_table(S,"STRUCTURAL ALIGNMENT MATRIX",TYPE_COLORS.get(doc_type,NAVY)))
+    story.append(type_badge_table(S,L("align_badge", lang),TYPE_COLORS.get(doc_type,NAVY)))
     story.append(Spacer(1,14))
-    story.append(Paragraph("ALIGNMENT MATRIX REPORT",S["Title"]))
-    story.append(Paragraph("ThesisSifu Pro v4.1 — Golden Thread Audit",S["Sub"]))
+    story.append(Paragraph(L("align_title", lang),S["Title"]))
+    story.append(Paragraph("ThesisSifu Pro v4.2 — " + L("align_sub", lang),S["Sub"]))
     story.append(HR(c=NAVY,t=1.5,b=4,a=10))
     story.append(meta_box(S,[("Document",filename),("Audit ID",audit_id),
         ("Date",datetime.now().strftime("%d %B %Y, %H:%M")),
@@ -1854,21 +2638,21 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
 
     gt = align.golden_thread_score
     gt_color = {"STRONG":GREEN,"ACCEPTABLE":AMBER,"WEAK":RED,"BROKEN":RED}.get(gt,ACCENT)
-    story.append(vbanner(S,f"Golden Thread: {gt}",gt_color,
-        subtitle="Problem -> RQ -> RO -> Method -> Analysis -> Finding -> Conclusion"))
+    story.append(vbanner(S,f"{L('golden_thread', lang)}: {gt}",gt_color,
+        subtitle="Problem -> Gap -> RQ -> Theory -> Method -> Analysis -> Finding -> Discussion -> Conclusion"))
     story.append(Spacer(1,10))
 
-    story.append(Paragraph("OVERALL ALIGNMENT VERDICT",S["SecHead"]))
+    story.append(Paragraph(L("overall_verdict", lang),S["SecHead"]))
     story.append(HR(c=NAVY,t=1,b=0,a=6))
     story.append(_safe_para(align.overall_verdict or "(no verdict generated)",S["Body"]))
     story.append(Spacer(1,8))
 
-    story.append(Paragraph("THESIS SPINE (for reference)",S["SecHead"]))
+    story.append(Paragraph(L("spine_ref", lang),S["SecHead"]))
     story.append(HR(c=NAVY,t=1,b=0,a=6))
-    story.append(spine_box(S,spine)); story.append(Spacer(1,10))
+    story.append(spine_box(S,spine,lang)); story.append(Spacer(1,10))
 
     story.append(PageBreak())
-    story.append(Paragraph("ALIGNMENT MATRIX — RQ-LEVEL TRACE",S["SecHead"]))
+    story.append(Paragraph(L("rq_trace", lang),S["SecHead"]))
     story.append(HR(c=NAVY,t=1,b=0,a=6))
 
     if not align.rows:
@@ -1900,7 +2684,7 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
             ("VALIGN",(0,0),(-1,-1),"TOP")]))
         story.append(t); story.append(Spacer(1,10))
 
-        story.append(Paragraph("ROW-BY-ROW NOTES",S["SecHead"]))
+        story.append(Paragraph(L("row_notes", lang),S["SecHead"]))
         story.append(HR(c=NAVY,t=1,b=0,a=6))
         for i,r in enumerate(align.rows,1):
             sc = ALIGN_COLORS.get(r.status,ACCENT)
@@ -1912,19 +2696,66 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
             hrow.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"),
                 ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0)]))
             story.append(hrow)
-            if r.note: story.append(_safe_para(f"<i>{r.note}</i>",S["Excerpt"]))
+            trace = [("Theory / construct", r.theory_construct), ("Instrument", r.instrument),
+                     ("Discussion", r.discussion)]
+            trace_txt = " | ".join(f"<b>{k}:</b> {v}" for k, v in trace if v and v != "—")
+            if trace_txt: story.append(_safe_para(trace_txt, S["TblCSm"]))
+            if r.broken_link: story.append(_safe_para(f"<b>{L('broken_link', lang)}:</b> {r.broken_link}", S["Detail"]))
+            if r.evidence:    story.append(_safe_para(f"<b>{L('evidence', lang)}:</b> <i>{r.evidence}</i>", S["Excerpt"]))
+            if r.note:        story.append(_safe_para(f"<i>{r.note}</i>",S["Excerpt"]))
+            if r.fix:         story.append(_safe_para(f"<b>{L('fix', lang)}:</b> {r.fix}", S["Detail"]))
             story.append(Spacer(1,6))
+
+    def _status_table(headers, rows, widths):
+        td = [[Paragraph(f"<b>{h}</b>", S["TblH"]) for h in headers]]
+        for cells, status in rows:
+            sc = ALIGN_COLORS.get(status, ACCENT)
+            td.append([_safe_para(str(x), S["TblCSm"]) for x in cells] +
+                      [Paragraph(f'<font color="{sc.hexval()}"><b>{status}</b></font>', S["TblCSm"])])
+        cw = W-4*cm
+        t = Table(td, colWidths=[cw*w for w in widths], repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0),NAVY),("TEXTCOLOR",(0,0),(-1,0),WHITE),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE,BOX_BG]),
+            ("BOX",(0,0),(-1,-1),.5,RULE),("INNERGRID",(0,0),(-1,-1),.3,RULE),
+            ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+            ("LEFTPADDING",(0,0),(-1,-1),4),("RIGHTPADDING",(0,0),(-1,-1),4),
+            ("VALIGN",(0,0),(-1,-1),"TOP")]))
+        return t
+
+    if align.chapter_links:
+        story.append(PageBreak())
+        story.append(Paragraph(L("chapter_links", lang), S["SecHead"]))
+        story.append(HR(c=NAVY,t=1,b=0,a=6))
+        story.append(_status_table(
+            ["Link", L("evidence", lang), L("fix", lang), "Status"],
+            [((f"{x.get('from_chapter','')} → {x.get('to_chapter','')}: {x.get('link','')}",
+               x.get("evidence",""), x.get("fix","")), str(x.get("status","UNCLEAR")).upper())
+             for x in align.chapter_links],
+            [.27, .33, .27, .13]))
+        story.append(Spacer(1,10))
+
+    if align.construct_consistency:
+        story.append(Paragraph(L("constructs", lang), S["SecHead"]))
+        story.append(HR(c=NAVY,t=1,b=0,a=6))
+        story.append(_status_table(
+            ["Construct", "Trace", "Note", "Status"],
+            [((x.get("construct",""), x.get("trace",""), x.get("note","")),
+              str(x.get("status","UNCLEAR")).upper())
+             for x in align.construct_consistency],
+            [.18, .42, .27, .13]))
+        story.append(Spacer(1,10))
 
     if align.critical_gaps:
         story.append(PageBreak())
-        story.append(Paragraph("CRITICAL STRUCTURAL GAPS",S["SecHead"]))
+        story.append(Paragraph(L("critical_gaps", lang),S["SecHead"]))
         story.append(HR(c=NAVY,t=1,b=0,a=6))
         for g in align.critical_gaps:
             story.append(_safe_para(f"• {g}",S["Bullet"]))
         story.append(Spacer(1,10))
 
     if align.structural_recommendations:
-        story.append(Paragraph("STRUCTURAL RECOMMENDATIONS",S["SecHead"]))
+        story.append(Paragraph(L("struct_recs", lang),S["SecHead"]))
         story.append(HR(c=NAVY,t=1,b=0,a=6))
         for rec in align.structural_recommendations:
             story.append(_safe_para(f"• {rec}",S["Bullet"]))
@@ -1932,7 +2763,7 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
 
     # Chapter delivery scorecard
     story.append(PageBreak())
-    story.append(Paragraph("CHAPTER DELIVERY SCORECARD",S["SecHead"]))
+    story.append(Paragraph(L("scorecard", lang),S["SecHead"]))
     story.append(HR(c=NAVY,t=1,b=0,a=6))
     story.append(Paragraph("Did each subsection deliver on its expected purpose? "
         "High critical counts against a subsection = it did not.",S["Body"]))
@@ -1964,7 +2795,7 @@ def build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs) ->
         ("INNERGRID",(0,0),(-1,-1),.3,RULE),("TOPPADDING",(0,0),(-1,-1),4),
         ("BOTTOMPADDING",(0,0),(-1,-1),4),("VALIGN",(0,0),(-1,-1),"TOP")]))
     story.append(t); story.append(Spacer(1,16)); story.append(HR())
-    story.append(Paragraph("ThesisSifu Pro v4.1 — Alignment Matrix. "
+    story.append(Paragraph("ThesisSifu Pro v4.2 — Alignment Matrix. "
         "Use alongside Report 1, 2, 3 to triangulate revision priorities.",S["Footer"]))
     doc.build(story); buf.seek(0); return buf.getvalue()
 
@@ -1982,6 +2813,104 @@ def _get_audit_lock() -> asyncio.Semaphore:
         _AUDIT_LOCK = asyncio.Semaphore(2)  # Level 2: 2 concurrent audits (requires 2GB RAM on Railway)
     return _AUDIT_LOCK
 
+# ── Audit pipeline (shared by /audit and /audit/stream) ────────
+def _progress(stage: str, message: str, pct: int):
+    return ("progress", {"stage": stage, "message": message, "pct": pct})
+
+async def _audit_pipeline(content: bytes, filename: str, audit_id: str):
+    """Async generator: yields ("progress", {...}) events, then ("result", {...})."""
+    import gc
+
+    yield _progress("extract", "Extracting text from document...", 5)
+    full_text = extract_text(content, filename)
+    print(f"[ThesisSifu] Extracted {len(full_text)} chars from {filename}")
+    if not full_text.strip():
+        full_text = "[Document appears image-based or empty — text extraction returned nothing]"
+    lang_info = detect_language(full_text)
+    lang = lang_info["lang"]
+    lang_name = "Bahasa Melayu" if lang == "ms" else "English"
+    print(f"[ThesisSifu] Language: {lang} (BM ratio {lang_info['bm_ratio']}, abstracts excluded)")
+    yield _progress("extract", f"Extracted {len(full_text):,} characters — thesis language: {lang_name}", 10)
+
+    chs = split_chapters(full_text)
+    for cs in chs:
+        cs.subsections = split_subsections(cs)
+    total_subs = sum(len(cs.subsections) for cs in chs)
+    print(f"[ThesisSifu] Split: {len(chs)} chapters, {total_subs} subsections")
+    yield _progress("split", f"Found {len(chs)} chapters, {total_subs} subsections", 14)
+
+    yield _progress("spine", "Extracting thesis spine and mapping what each chapter commits to...", 16)
+    spine, clf, _ = await asyncio.gather(
+        extract_spine(full_text, chs), classify_document(full_text), digest_chapters(chs))
+    doc_type = clf.get("type", "MASTERS")
+    field    = clf.get("field", "UNKNOWN")
+    inst     = clf.get("institution", "UNKNOWN")
+    if spine.title == "UNKNOWN" and clf.get("title", "UNKNOWN") != "UNKNOWN":
+        spine.title = clf["title"]
+    digested = sum(1 for cs in chs if cs.digest)
+    print(f"[ThesisSifu] doc_type={doc_type} title={spine.title[:60]} digests={digested}/{len(chs)}")
+    yield _progress("spine", f"Spine extracted — {len(spine.research_questions)} RQs found; "
+                             f"golden-thread map built for {digested}/{len(chs)} chapters", 26)
+
+    thread = thread_context(chs)
+    sem = asyncio.Semaphore(10)
+    async def bounded(sub, cs):
+        async with sem:
+            return sub, await audit_subsection(sub, cs, doc_type, spine, full_text, thread, lang)
+    tasks = [bounded(sub, cs) for cs in chs for sub in cs.subsections]
+    yield _progress("audit", f"Auditing {len(tasks)} subsections in parallel...", 28)
+    done, step = 0, max(1, len(tasks) // 8)
+    for fut in asyncio.as_completed(tasks):
+        sub, cmts = await fut
+        sub.comments = cmts
+        done += 1
+        if done % step == 0 or done == len(tasks):
+            yield _progress("audit", f"Audited {done}/{len(tasks)} subsections...",
+                            28 + int(done / len(tasks) * 34))
+    for cs in chs:
+        cs.comments = [c for sub in cs.subsections for c in sub.comments]
+    del tasks
+    gc.collect()
+    total_comments = sum(len(cs.comments) for cs in chs)
+    print(f"[ThesisSifu] Total paragraph comments: {total_comments}")
+    yield _progress("audit", f"Paragraph audit complete — {total_comments} comments", 62)
+
+    yield _progress("analysis", "Tracing the golden thread across chapters and retrieving "
+                                "supporting literature...", 64)
+    align, verified_refs = await asyncio.gather(
+        run_alignment_audit(spine, chs, lang), attach_literature(chs, lang))
+    print(f"[ThesisSifu] Alignment score={align.golden_thread_score} refs={len(verified_refs)}")
+    yield _progress("analysis", f"Golden thread: {align.golden_thread_score}; "
+                                f"{len(verified_refs)} verified references found", 76)
+
+    yield _progress("analysis", "Writing the examiner report...", 78)
+    examiner_text = await run_examiner(doc_type, spine, field, inst, chs, align, verified_refs, lang)
+    gc.collect()
+
+    yield _progress("pdf", "Building PDF reports...", 88)
+    pdf1 = build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, align, chs, lang)
+    pdf3 = build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs, lang)
+    pdf4 = build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs, lang)
+    if filename.lower().endswith(".pdf"):
+        output2   = build_annotated_pdf(content, full_text, audit_id, chs, lang)
+        out2_name = "2_Annotated_Thesis.pdf"
+    else:
+        output2   = build_annotated_docx(content, filename, audit_id, chs, clf, lang)
+        out2_name = "2_Annotated_Thesis.docx"
+    del content, chs, examiner_text, align
+    gc.collect()
+
+    yield _progress("zip", "Packaging ZIP...", 95)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("1_Examiner_Audit_Report.pdf", pdf1)
+        zf.writestr(out2_name, output2)
+        zf.writestr("3_Commentary_Report.pdf", pdf3)
+        zf.writestr("4_Alignment_Matrix_Report.pdf", pdf4)
+    print(f"[ThesisSifu] Audit {audit_id} complete. ZIP ready.")
+    yield ("result", {"zip_bytes": buf.getvalue(), "comments": total_comments, "lang": lang})
+
+
 # ── Main endpoint ──────────────────────────────────────────────
 @app.post("/audit")
 async def audit_document(file: UploadFile = File(...)):
@@ -1995,97 +2924,13 @@ async def audit_document(file: UploadFile = File(...)):
     print(f"[ThesisSifu] Starting audit {audit_id} for {filename}")
 
     async with _get_audit_lock():
-        return await _run_audit(content, filename, audit_id)
+        result = None
+        async for kind, data in _audit_pipeline(content, filename, audit_id):
+            if kind == "result":
+                result = data
 
-
-async def _run_audit(content: bytes, filename: str, audit_id: str):
-    """Core audit pipeline — runs under the global lock."""
-    import gc
-
-    # 1. Extract text
-    full_text = extract_text(content, filename)
-    print(f"[ThesisSifu] Extracted {len(full_text)} chars from {filename}")
-    if not full_text.strip():
-        full_text = "[Document appears image-based or empty — text extraction returned nothing]"
-
-    # 2. Stage 0+1: spine extraction + classification (parallel)
-    spine_task = asyncio.create_task(extract_spine(full_text, full_text))
-    clf_task   = asyncio.create_task(classify_document(full_text))
-    spine, clf = await asyncio.gather(spine_task, clf_task)
-
-    doc_type = clf.get("type","MASTERS")
-    field    = clf.get("field","UNKNOWN")
-    inst     = clf.get("institution","UNKNOWN")
-    if spine.title == "UNKNOWN" and clf.get("title","UNKNOWN") != "UNKNOWN":
-        spine.title = clf["title"]
-    print(f"[ThesisSifu] doc_type={doc_type} title={spine.title[:60]}")
-    print(f"[ThesisSifu] Spine RQs: {spine.research_questions[:3]}")
-
-    # 3. Split chapters + subsections
-    chs = split_chapters(full_text)
-    for cs in chs:
-        cs.subsections = split_subsections(cs)
-    total_subs = sum(len(cs.subsections) for cs in chs)
-    print(f"[ThesisSifu] Split: {len(chs)} chapters, {total_subs} subsections")
-
-    # 4. Stage 2: subsection paragraph audit (parallel, max 10 concurrent)
-    sem = asyncio.Semaphore(10)
-    async def bounded(sub: Subsection, ch_title: str):
-        async with sem:
-            cmts = await audit_subsection(sub, ch_title, doc_type, spine, full_text)
-            return sub, cmts
-
-    tasks   = [bounded(sub, cs.chapter_title) for cs in chs for sub in cs.subsections]
-    results = await asyncio.gather(*tasks)
-
-    for sub, cmts in results:
-        sub.comments = cmts
-    for cs in chs:
-        cs.comments = [c for sub in cs.subsections for c in sub.comments]
-
-    # Free task list memory before next stage
-    del tasks, results
-    gc.collect()
-
-    total_comments = sum(len(cs.comments) for cs in chs)
-    print(f"[ThesisSifu] Total paragraph comments: {total_comments}")
-
-    # 5+6. Alignment audit + examiner report in PARALLEL
-    print(f"[ThesisSifu] Running alignment + examiner in parallel...")
-    align, examiner_text = await asyncio.gather(
-        run_alignment_audit(spine, chs),
-        run_examiner(doc_type, spine, field, inst, chs, AlignmentMatrix())
-    )
-    print(f"[ThesisSifu] Alignment score={align.golden_thread_score}")
-    gc.collect()
-
-    # 7. Build outputs — free content bytes after annotated PDF is built
-    pdf1    = build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, align, chs)
-    pdf3    = build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs)
-    pdf4    = build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs)
-
-    if filename.lower().endswith(".pdf"):
-        output2   = build_annotated_pdf(content, full_text, audit_id, chs)
-        out2_name = "2_Annotated_Thesis.pdf"
-    else:
-        output2   = build_annotated_docx(content, filename, audit_id, chs, clf)
-        out2_name = "2_Annotated_Thesis.docx"
-
-    # Free the large objects before building ZIP
-    del content, full_text, chs, examiner_text, spine, align
-    gc.collect()
-    print(f"[ThesisSifu] Memory freed, building ZIP...")
-
-    # 8. ZIP and return
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("1_Examiner_Audit_Report.pdf", pdf1)
-        zf.writestr(out2_name, output2)
-        zf.writestr("3_Commentary_Report.pdf", pdf3)
-        zf.writestr("4_Alignment_Matrix_Report.pdf", pdf4)
-    tmp.close()
-    print(f"[ThesisSifu] Audit {audit_id} complete. ZIP ready.")
-
+    tmp.write(result["zip_bytes"]); tmp.close()
     return FileResponse(
         path=tmp.name, media_type="application/zip",
         filename=f"ThesisSifu_v4_Audit_{audit_id}.zip",
@@ -2095,7 +2940,7 @@ async def _run_audit(content: bytes, filename: str, audit_id: str):
 
 
 # ── In-memory result store ─────────────────────────────────────
-# Stores completed ZIP bytes keyed by audit_id for ~5 minutes
+# Stores completed ZIP bytes keyed by audit_id for ~10 minutes
 # so the browser can download after SSE stream ends.
 _RESULTS: dict[str, bytes] = {}
 _RESULT_LOCK = None  # lazy init like _AUDIT_LOCK
@@ -2111,6 +2956,25 @@ def _sse(event: str, data: dict) -> str:
     """Format a Server-Sent Event string."""
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
+_KEEPALIVE_SECS = 15
+
+async def _await_with_keepalive(aw):
+    """Await `aw`, yielding SSE comment lines every few seconds meanwhile.
+    Long stages (chapter digests, alignment, examiner) can run for minutes without
+    a progress event; proxies drop idle connections, so we keep bytes flowing.
+    The awaited result is delivered as the final item: ("value", result)."""
+    fut = asyncio.ensure_future(aw)
+    try:
+        while True:
+            done, _ = await asyncio.wait({fut}, timeout=_KEEPALIVE_SECS)
+            if done:
+                yield ("value", fut.result())
+                return
+            yield ("keepalive", ": keepalive\n\n")
+    finally:
+        if not fut.done():      # client disconnected: stop the work
+            fut.cancel()
+
 
 @app.post("/audit/stream")
 async def audit_stream(file: UploadFile = File(...)):
@@ -2122,7 +2986,8 @@ async def audit_stream(file: UploadFile = File(...)):
     Events emitted:
       progress  { stage: str, message: str, pct: int }
       error     { message: str }
-      done      { audit_id: str, filename: str }
+      done      { audit_id: str, filename: str, comments: int }
+    Comment lines (": keepalive") are sent during long stages.
     """
     content  = await file.read()
     filename = file.filename or "document"
@@ -2135,143 +3000,55 @@ async def audit_stream(file: UploadFile = File(...)):
     audit_id = "SUP-" + hashlib.md5(content).hexdigest()[:10].upper()
 
     async def _stream() -> AsyncGenerator[str, None]:
-        import gc
+        lock = _get_audit_lock()
+        acquired = False
+        agen = _audit_pipeline(content, filename, audit_id)
         try:
-            yield _sse("progress", {"stage": "extract", "message": "Extracting text from document...", "pct": 5})
+            if lock.locked():
+                yield _sse("progress", {"stage": "queue", "message": "Waiting for an audit slot...", "pct": 1})
+            async for kind, val in _await_with_keepalive(lock.acquire()):
+                if kind == "keepalive":
+                    yield val
+            acquired = True
 
-            full_text = extract_text(content, filename)
-            if not full_text.strip():
-                full_text = "[Document appears image-based or empty]"
-            yield _sse("progress", {"stage": "extract", "message": f"Extracted {len(full_text):,} characters", "pct": 10})
-
-            yield _sse("progress", {"stage": "spine", "message": "Extracting thesis spine (RQs, methodology, theory)...", "pct": 15})
-            spine_task = asyncio.create_task(extract_spine(full_text, full_text))
-            clf_task   = asyncio.create_task(classify_document(full_text))
-            spine, clf = await asyncio.gather(spine_task, clf_task)
-
-            doc_type = clf.get("type", "MASTERS")
-            field    = clf.get("field", "UNKNOWN")
-            inst     = clf.get("institution", "UNKNOWN")
-            if spine.title == "UNKNOWN" and clf.get("title", "UNKNOWN") != "UNKNOWN":
-                spine.title = clf["title"]
-            rq_count = len(spine.research_questions)
-            yield _sse("progress", {
-                "stage": "spine",
-                "message": f"Spine extracted — {rq_count} RQs found, theory: {spine.theory_used[:40]}",
-                "pct": 20
-            })
-
-            yield _sse("progress", {"stage": "split", "message": "Splitting chapters and subsections...", "pct": 22})
-            chs = split_chapters(full_text)
-            for cs in chs:
-                cs.subsections = split_subsections(cs)
-            total_subs = sum(len(cs.subsections) for cs in chs)
-            yield _sse("progress", {
-                "stage": "split",
-                "message": f"Found {len(chs)} chapters, {total_subs} subsections",
-                "pct": 25
-            })
-
-            yield _sse("progress", {"stage": "audit", "message": f"Auditing {total_subs} subsections in parallel...", "pct": 28})
-
-            # Run subsection audit with progress updates per chapter
-            sem = asyncio.Semaphore(10)
-            completed = {"n": 0}
-
-            async def bounded_with_progress(sub, ch_title):
-                async with sem:
-                    cmts = await audit_subsection(sub, ch_title, doc_type, spine, full_text)
-                    completed["n"] += 1
-                    return sub, cmts
-
-            tasks = [bounded_with_progress(sub, cs.chapter_title)
-                     for cs in chs for sub in cs.subsections]
-
-            # Gather with periodic progress yields
-            results = []
-            batch_size = max(1, len(tasks) // 5)
-            for i in range(0, len(tasks), batch_size):
-                batch = tasks[i:i + batch_size]
-                batch_results = await asyncio.gather(*batch)
-                results.extend(batch_results)
-                pct = 28 + int((len(results) / len(tasks)) * 40)
-                yield _sse("progress", {
-                    "stage": "audit",
-                    "message": f"Audited {len(results)}/{len(tasks)} subsections...",
-                    "pct": pct
-                })
-
-            for sub, cmts in results:
-                sub.comments = cmts
-            for cs in chs:
-                cs.comments = [c for sub in cs.subsections for c in sub.comments]
-
-            total_comments = sum(len(cs.comments) for cs in chs)
-            del tasks, results
-            gc.collect()
-            yield _sse("progress", {
-                "stage": "audit",
-                "message": f"Paragraph audit complete — {total_comments} comments generated",
-                "pct": 68
-            })
-
-            yield _sse("progress", {"stage": "analysis", "message": "Running alignment audit and examiner report...", "pct": 70})
-            align, examiner_text = await asyncio.gather(
-                run_alignment_audit(spine, chs),
-                run_examiner(doc_type, spine, field, inst, chs, AlignmentMatrix())
-            )
-            yield _sse("progress", {
-                "stage": "analysis",
-                "message": f"Analysis complete — golden thread: {align.golden_thread_score}",
-                "pct": 82
-            })
-            gc.collect()
-
-            yield _sse("progress", {"stage": "pdf", "message": "Building PDF reports...", "pct": 85})
-            pdf1 = build_examiner_pdf(filename, audit_id, doc_type, clf, spine, examiner_text, align, chs)
-            pdf3 = build_commentary_pdf(filename, audit_id, doc_type, clf, spine, chs)
-            pdf4 = build_alignment_pdf(filename, audit_id, doc_type, clf, spine, align, chs)
-
-            if filename.lower().endswith(".pdf"):
-                output2   = build_annotated_pdf(content, full_text, audit_id, chs)
-                out2_name = "2_Annotated_Thesis.pdf"
-            else:
-                output2   = build_annotated_docx(content, filename, audit_id, chs, clf)
-                out2_name = "2_Annotated_Thesis.docx"
-
-            del content, full_text, chs, examiner_text, spine, align
-            gc.collect()
-
-            yield _sse("progress", {"stage": "zip", "message": "Packaging ZIP...", "pct": 93})
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("1_Examiner_Audit_Report.pdf", pdf1)
-                zf.writestr(out2_name, output2)
-                zf.writestr("3_Commentary_Report.pdf", pdf3)
-                zf.writestr("4_Alignment_Matrix_Report.pdf", pdf4)
-            zip_bytes = buf.getvalue()
-
-            # Store result for download
-            async with _get_result_lock():
-                _RESULTS[audit_id] = zip_bytes
-
-            # Schedule cleanup after 10 minutes
-            async def _cleanup():
-                await asyncio.sleep(600)
+            while True:
+                item = None
+                async for kind, val in _await_with_keepalive(agen.__anext__()):
+                    if kind == "keepalive":
+                        yield val
+                    else:
+                        item = val
+                event, data = item
+                if event == "progress":
+                    yield _sse("progress", data)
+                    continue
+                # event == "result"
                 async with _get_result_lock():
-                    _RESULTS.pop(audit_id, None)
-            asyncio.create_task(_cleanup())
+                    _RESULTS[audit_id] = data["zip_bytes"]
 
-            yield _sse("progress", {"stage": "done", "message": "Audit complete!", "pct": 100})
-            yield _sse("done", {
-                "audit_id": audit_id,
-                "filename": f"ThesisSifu_v4_Audit_{audit_id}.zip",
-                "comments": total_comments,
-            })
+                async def _cleanup():
+                    await asyncio.sleep(600)
+                    async with _get_result_lock():
+                        _RESULTS.pop(audit_id, None)
+                asyncio.create_task(_cleanup())
 
+                yield _sse("progress", {"stage": "done", "message": "Audit complete!", "pct": 100})
+                yield _sse("done", {
+                    "audit_id": audit_id,
+                    "filename": f"ThesisSifu_v4_Audit_{audit_id}.zip",
+                    "comments": data["comments"],
+                })
+                break
         except Exception as e:
             print(f"[ThesisSifu] Stream error: {e}\n{traceback.format_exc()}")
             yield _sse("error", {"message": f"Audit failed: {str(e)[:200]}"})
+        finally:
+            try:
+                await agen.aclose()
+            except Exception:
+                pass
+            if acquired:
+                lock.release()
 
     return StreamingResponse(
         _stream(),
@@ -2301,27 +3078,16 @@ async def audit_download(audit_id: str):
     )
 
 
-
+@app.get("/health")
 async def health():
     return {
         "status":                "ok",
         "gemini_available":      gemini_client is not None,
         "gemini_model":          GEMINI_MODEL,
         "claude_available":      claude_client is not None,
-        "version":               "4.1.1",
-        "fixes":                 [
-            "google.genai SDK (not deprecated google.generativeai)",
-            "robust chapter splitter (Roman numerals, word numbers, plain numbered headings)",
-            "subsection filter removed (was breaking on Roman numeral chapters)",
-            "safe Gemini response handler with finish_reason logging",
-            "page estimation uses full_text offset not subsection slice",
-            "prompt injection uses .replace() not .format() (no KeyError on curly braces)",
-            "annotated PDF uses wider search window + shorter fallback search",
-            "all exceptions logged with chapter+subsection context",
-            "ThesisSpine fields coerced to declared str/list types at construction "
-            "(fixes 'TypeError: replace() argument 2 must be str, not list' when "
-            "Gemini returns an array for a documented-as-string field)",
-        ],
+        "claude_model":          CLAUDE_MODEL,
+        "literature_source":     "openalex" if OPENALEX_API_KEY else "crossref",
+        "version":               "4.2.0",
         "outputs": ["1_Examiner_Audit_Report.pdf","2_Annotated_Thesis.(docx|pdf)",
                     "3_Commentary_Report.pdf","4_Alignment_Matrix_Report.pdf"],
     }

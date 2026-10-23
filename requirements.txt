@@ -7,6 +7,6 @@ pypdf
 PyMuPDF
 reportlab
 Pillow
-google-genai>=0.8.0 
-anthropic
+google-genai>=1.0
+anthropic>=2.1,<3
 pdfplumber>=0.11.0
