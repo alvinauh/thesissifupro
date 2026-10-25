@@ -16,6 +16,10 @@ stream endpoint) and waits for the ZIP with no client-side timeout.
 | 4 | Alignment audit (RQ trace, chapter-to-chapter links, construct consistency) ∥ literature grounding | Claude Sonnet 5 ∥ OpenAlex/Crossref + Gemini |
 | 5 | Examiner report — runs **after** stage 4 and receives its results + verified literature | Claude Sonnet 5 |
 
+Stages 4 and 5 receive the **full thesis text** (chapters, front matter excluded, prompt-cached) and are told to
+verify every assistant-prepared point against it. The spine is automatic and may be incomplete: prompts say
+"NOT FOUND" means extraction missed it, never that the thesis lacks it.
+
 Outputs: `1_Examiner_Audit_Report.pdf`, `2_Annotated_Thesis.(docx|pdf)`, `3_Commentary_Report.pdf`,
 `4_Alignment_Matrix_Report.pdf`. For BM theses every report, label and comment is in formal BM (DBP).
 
@@ -58,6 +62,17 @@ v4.2 is on branch `improve/golden-thread-bm-literature`. Tested locally on real 
 responses** only: language detection, chapter splitting, BM RQ/RO extraction, live Crossref/OpenAlex search,
 report building (BM + EN), SSE keep-alives, `/audit`, `/health`. **Not yet tested with real Gemini/Claude
 calls** — feedback quality and audit duration are unverified.
+
+## Why lecturers found v4.1 unhelpful (from real v4.1 reports, Oct 2026)
+- Both Claude stages crashed in production (`temperature` rejected by anthropic SDK 2.x): no examiner report,
+  empty alignment matrix, and the verdict banner read "FAIL" because it matched the word "failed".
+- Spine said RQs/ROs "NOT FOUND" although the thesis had them; comments then told the student, as CRITICAL,
+  that their RQs were missing.
+- Chapter split broke (SPSS output read as chapter headings; unheaded Chapter 4 merged into Chapter 3), so
+  results were judged as methodology.
+- 196 comments with 91 CRITICAL; comments spoke the tool's jargon ("THESIS SPINE", "expected purpose");
+  literature advice was generic; `YEAR_PLACEHOLDER` leaked into feedback.
+- The examiner never read the thesis — it judged chapters by how many comments they got.
 
 ## Gotchas
 - `anthropic` SDK 2.x rejects `temperature`; keep the pin `anthropic>=2.1,<3`.

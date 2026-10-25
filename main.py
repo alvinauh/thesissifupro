@@ -587,9 +587,10 @@ _CH_PAT = re.compile(
     r'(?:'
       # "CHAPTER 1", "CHAPTER I", "CHAPTER ONE", "BAB 1", "BAHAGIAN 2"
       r'(?:CHAPTER|BAHAGIAN|BAB)\s+(\d{1,2}|[IVX]+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN'
-      r'|SATU|DUA|TIGA|EMPAT|LIMA|ENAM|TUJUH|LAPAN|SEMBILAN|SEPULUH)\b'
-      # "1.0 Introduction" or "2.0 Literature Review" — ONLY N.0 forms, not N.432
-      r'|(\d{1,2})\.0+\s'
+      r'|SATU|DUA|TIGA|EMPAT|LIMA|ENAM|TUJUH|LAPAN|SEMBILAN|SEPULUH)(?:\.0+)?\b'   # "CHAPTER 1.0 :"
+      # "1.0 Introduction" or "2.0 Literature Review" — ONLY N.0 forms followed by a word,
+      # never statistics or SPSS output ("1.00   8 . 0", "3.432")
+      r'|(\d{1,2})\.0+[ \t]+(?=[A-Za-z])'
     r')'
     r'[:\s\-—–]*([^\n]{0,100})',
     re.IGNORECASE,
@@ -791,7 +792,27 @@ def split_chapters(text: str) -> list[ChapterSummary]:
             chapter_num=num, chapter_title=title,
             text=text[start:end].strip(), char_offset=start))
     _recover_chapter_one(text, chapters)
+    _split_unheaded_chapters(chapters)
     return chapters or [ChapterSummary("1", "Full Document", text, 0)]
+
+def _split_unheaded_chapters(chapters: list) -> None:
+    """Some theses omit a chapter heading (e.g. no "CHAPTER 4"), so its sections
+    (4.1, 4.2 ...) end up inside the previous chapter and get judged against the
+    wrong chapter's purpose. Split where numbering moves to a missing chapter."""
+    i = 0
+    while i < len(chapters):
+        cs = chapters[i]
+        have = {c.chapter_num for c in chapters}
+        nxt = str(int(cs.chapter_num) + 1) if cs.chapter_num.isdigit() else None
+        m = None
+        if nxt and nxt not in have:
+            m = re.search(r'(?:^|\n)[ \t]*' + nxt + r'\.1[ \t:]+[A-Za-z][^\n]*', cs.text)
+        if m and m.start() > 1000:
+            body = cs.text[m.start():].strip()
+            cs.text = cs.text[:m.start()].strip()
+            chapters.insert(i + 1, ChapterSummary(nxt, f"Chapter {nxt}", body, cs.char_offset + m.start()))
+            print(f"[ThesisSifu] Split unheaded Chapter {nxt} out of Chapter {cs.chapter_num}")
+        i += 1
 
 _TOC_LINE = re.compile(r'(?:\t|\.{3,}|\s{2,})\s*\d{1,3}\s*$')
 
@@ -1300,9 +1321,17 @@ What examiners check in this kind of chapter:
 CHECKS_PLACEHOLDER
 CURRENT YEAR: YEAR_PLACEHOLDER (Do not flag 2024-YEAR_PLACEHOLDER citations as "future" or "unpublished").
 
-Report 0-5 GENUINE issues — only real weaknesses an examiner would raise. Do not pad: if the
-subsection is sound, return []. Prefer substantive issues (argument, evidence, alignment,
-method, interpretation) over wording. Return a JSON array; each element:
+Report 0-5 GENUINE issues — only real weaknesses an experienced examiner would raise. Do not pad:
+if the subsection is sound, return []. Prefer substantive issues (argument, evidence, alignment,
+method, interpretation) over wording, and do not repeat an issue that belongs to another section.
+
+Write as a senior supervisor speaking to the student about THEIR text: refer to their own
+headings, research questions, constructs and page content. Never mention this tool's internal
+terms ("thesis spine", "expected purpose", "golden-thread map", "subsection audit", "placeholder").
+The spine and map above were extracted automatically and may be incomplete: a field reading
+NOT FOUND means the extraction missed it, NOT that the thesis lacks it. Only say something is
+missing from the thesis if the text you are reading shows that it is.
+Return a JSON array; each element:
 {
   "para_excerpt": "first 80 characters of the paragraph, copied verbatim",
   "severity": "CRITICAL|MODERATE|SUGGESTION",
@@ -1316,7 +1345,8 @@ method, interpretation) over wording. Return a JSON array; each element:
   "suggested_method": "e.g. PLS-SEM (Hair et al., 2022) or empty string"
 }
 
-Severity:
+Severity (calibrate like an external examiner — most issues are MODERATE; CRITICAL is rare and
+means the examiner would require it fixed before the thesis can pass):
   CRITICAL   — breaks the golden thread or validity: contradicts/ignores an RQ, RO or hypothesis;
                a construct is not measured or not analysed; the method cannot answer the RQ; a
                finding maps to no RQ; a conclusion overreaches the data; the subsection fails its purpose.
@@ -1593,9 +1623,10 @@ _ALIGNMENT_SYSTEM = """\
 You are a senior academic examiner auditing the STRUCTURAL ALIGNMENT (golden thread) of a thesis:
 Problem -> Gap -> RQ -> RO -> Hypothesis -> Theory/Constructs -> Design/Instrument -> Analysis
 -> Findings -> Discussion -> Conclusion/Contribution.
-You judge from the chapter digests, which record what each chapter actually commits to, with
-verbatim quotes. A link is only ALIGNED if the digests show it in BOTH chapters; if a later
-chapter never picks up what an earlier one promised (or the reverse), that is a break.
+The full thesis is provided above; the chapter digests below are an index of what each chapter
+commits to. Verify against the thesis text itself. A link is only ALIGNED if the text shows it in
+BOTH chapters; if a later chapter never picks up what an earlier one promised (or the reverse),
+that is a break. The spine was extracted automatically and may be incomplete — trust the thesis.
 Cite evidence as chapter + section + short quote. Be specific and fair: say what is aligned as
 well as what is broken.\
 """
@@ -1637,12 +1668,34 @@ _ALIGNMENT_SCHEMA = {
     "additionalProperties": False,
 }
 
+_PANEL_SYSTEM = """\
+You are a senior academic examiner with 25 years of experience supervising and examining
+theses. You read the candidate's thesis yourself and judge it on its substance. Your feedback
+is specific (chapter, section, quote), fair (credit genuine strengths), and actionable (say
+exactly what to change). You are an intellectual critic, not a grammar checker.\
+"""
+
+def thesis_document(chs: list, limit: int = 400000) -> str:
+    """The thesis chapters as one document for Claude (front matter excluded).
+    Each chapter is capped so appendices pasted into the last chapter can't crowd out the rest."""
+    parts = [f"<chapter number=\"{cs.chapter_num}\" title=\"{cs.chapter_title}\">\n{cs.text[:120000]}\n</chapter>"
+             for cs in chs if cs.text.strip()]
+    return "<thesis>\n" + "\n".join(parts)[:limit] + "\n</thesis>"
+
 async def _claude_text(system: str, prompt: str, context: str,
-                       schema: Optional[dict] = None, max_tokens: int = 32000) -> str:
-    """One Claude call (streamed, so long outputs don't hit HTTP timeouts)."""
-    kwargs = dict(model=CLAUDE_MODEL, max_tokens=max_tokens, system=system,
+                       schema: Optional[dict] = None, max_tokens: int = 32000,
+                       document: str = "") -> str:
+    """One Claude call (streamed, so long outputs don't hit HTTP timeouts).
+    The thesis document goes first with a cache breakpoint: the alignment audit and the
+    examiner share the same system prompt and document, so the second call reads it from cache.
+    `system` holds the stage-specific instructions and is sent after the document."""
+    content = []
+    if document:
+        content.append({"type": "text", "text": document, "cache_control": {"type": "ephemeral"}})
+    content.append({"type": "text", "text": f"{system}\n\n{prompt}"})
+    kwargs = dict(model=CLAUDE_MODEL, max_tokens=max_tokens, system=_PANEL_SYSTEM,
                   thinking={"type": "adaptive"},
-                  messages=[{"role": "user", "content": prompt}])
+                  messages=[{"role": "user", "content": content}])
     output_config = {"effort": CLAUDE_EFFORT}
     if schema:
         output_config["format"] = {"type": "json_schema", "schema": schema}
@@ -1654,7 +1707,8 @@ async def _claude_text(system: str, prompt: str, context: str,
     if msg.stop_reason == "max_tokens":
         print(f"[ThesisSifu] WARNING {context}: hit max_tokens, output may be truncated")
     u = msg.usage
-    print(f"[ThesisSifu] {context}: in={u.input_tokens} out={u.output_tokens} stop={msg.stop_reason}")
+    print(f"[ThesisSifu] {context}: in={u.input_tokens} cache_read={getattr(u, 'cache_read_input_tokens', 0)} "
+          f"cache_write={getattr(u, 'cache_creation_input_tokens', 0)} out={u.output_tokens} stop={msg.stop_reason}")
     return "".join(b.text for b in msg.content if b.type == "text").strip()
 
 _ALIGNMENT_PROMPT_TEMPLATE = """\
@@ -1743,7 +1797,7 @@ async def run_alignment_audit(spine: ThesisSpine, chs: list[ChapterSummary], lan
     )
     try:
         d = _parse_json_loose(await _claude_text(_ALIGNMENT_SYSTEM, prompt, "alignment_audit",
-                                                 schema=_ALIGNMENT_SCHEMA))
+                                                 schema=_ALIGNMENT_SCHEMA, document=thesis_document(chs)))
         rows = [AlignmentRow(**{k: _flatten_to_str(r.get(k, "—")) for k in (
                     "rq", "ro", "hypothesis", "theory_construct", "method", "instrument",
                     "analysis", "finding", "discussion", "conclusion", "broken_link",
@@ -1772,9 +1826,11 @@ async def run_alignment_audit(spine: ThesisSpine, chs: list[ChapterSummary], lan
 
 # ── Stage 4: Holistic Examiner (Claude) ───────────────────────
 _EXAMINER_SYSTEM = """\
-You are a senior academic examiner with 25 years of experience.
-Produce rigorous, specific, honest examiner-level critique anchored to the provided thesis
-spine, alignment audit and chapter issues. You are an intellectual critic, not a grammar checker.
+Write the examiner report on the thesis provided above. Read the thesis itself: the spine,
+alignment audit and issue summary below are aids prepared by assistants — confirm each point
+against the text before using it, and drop any that the text contradicts. Never judge a chapter
+by how many comments it received. The spine was extracted automatically and may be incomplete;
+"NOT FOUND" means the extraction missed it, not that the thesis lacks it.
 
 For every weakness you raise:
   1. Locate it (chapter / section) and state the evidence (short quote or precise paraphrase).
@@ -2049,7 +2105,8 @@ async def run_examiner(doc_type: str, spine: ThesisSpine, field: str, inst: str,
     # the alignment detail and verified literature go just before it.
     prompt = prompt.replace("\nWrite a", "\n" + extra + "\n\nWrite a", 1)
     try:
-        return await _claude_text(_EXAMINER_SYSTEM, prompt, "examiner_report")
+        return await _claude_text(_EXAMINER_SYSTEM, prompt, "examiner_report",
+                                  document=thesis_document(chs))
     except Exception as e:
         print(f"[ThesisSifu] Examiner error: {e}\n{traceback.format_exc()}")
         return f"Examiner synthesis failed: {e}"
