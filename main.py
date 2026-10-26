@@ -566,9 +566,51 @@ def extract_text(content: bytes, filename: str) -> str:
             print(f"[ThesisSifu] pypdf also failed: {e}")
             return ""
     if fn.endswith(".docx"):
-        doc = DocxDocument(io.BytesIO(content))
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        return _docx_text(DocxDocument(io.BytesIO(content)))
     return ""
+
+
+_W_P, _W_TBL, _W_SDT = qn("w:p"), qn("w:tbl"), qn("w:sdt")
+_TEXT_TAGS = {qn("w:t"), qn("m:t")}
+
+def _para_text(p) -> str:
+    """Text of one w:p, INCLUDING Word equations (m:t). python-docx's paragraph.text
+    drops equations, so "(rs = .717, p < .001)" typed in the equation editor came out
+    as "( )" and the auditors reported the statistics as missing."""
+    out = []
+    for el in p.iter():
+        if el.tag in _TEXT_TAGS and el.text:
+            out.append(el.text)
+        elif el.tag == qn("w:tab"):
+            out.append("\t")
+        elif el.tag in (qn("w:br"), qn("w:cr")):
+            out.append("\n")
+    return "".join(out)
+
+def _docx_text(doc) -> str:
+    """Body text in document order: paragraphs, tables (one line per row, cells
+    separated by " | ") and content controls. Tables used to be skipped entirely —
+    for results chapters that is most of the data."""
+    lines = []
+    def walk(container):
+        for el in container.iterchildren():
+            if el.tag == _W_P:
+                t = _para_text(el)
+                if t.strip():
+                    lines.append(t)
+            elif el.tag == _W_TBL:
+                for tr in el.iter(qn("w:tr")):
+                    cells = []
+                    for tc in tr.iterchildren(qn("w:tc")):
+                        cells.append(" ".join(_para_text(p).strip() for p in tc.iter(_W_P)).strip())
+                    if any(cells):
+                        lines.append(" | ".join(cells))
+            elif el.tag == _W_SDT:
+                content = el.find(qn("w:sdtContent"))
+                if content is not None:
+                    walk(content)
+    walk(doc.element.body)
+    return "\n".join(lines)
 
 
 # ── Chapter + Subsection splitter (robust) ────────────────────
@@ -772,6 +814,11 @@ def split_chapters(text: str) -> list[ChapterSummary]:
         # "Bab 1 ini membincangkan ..." / "Chapter 2 reviews ..." is a sentence
         # referring to a chapter, not a heading: headings aren't lower-case.
         if title and title[0].islower():
+            continue
+        # Table-of-contents entries ("4.0 RESULTS ........ | 17") are not chapters.
+        line_end = text.find("\n", m.end())
+        line = text[m.start():line_end if line_end != -1 else len(text)]
+        if re.search(r'\.{4,}|…{2,}|(?:\||\t)\s*\d{1,3}\s*$', line):
             continue
         if not title:
             next_nl = text.find("\n", m.end())
@@ -1300,7 +1347,7 @@ Your feedback must be specific enough that the student knows exactly what to cha
 
 LANG_PLACEHOLDER
 
-THESIS SPINE:
+THE STUDY (as stated by the student; automatically summarised, may be incomplete):
   Title:      TITLE_PLACEHOLDER
   Problem:    PROBLEM_PLACEHOLDER
   Gap:        GAP_PLACEHOLDER
@@ -1311,12 +1358,12 @@ THESIS SPINE:
   Method:     METHOD_PLACEHOLDER
   Analysis:   ANALYSIS_PLACEHOLDER
 
-WHAT THE OTHER CHAPTERS COMMIT TO (golden-thread map — use it to catch cross-chapter breaks):
+WHAT THE STUDENT'S OTHER CHAPTERS SAY (use it to catch breaks between chapters):
 THREAD_PLACEHOLDER
 
 CHAPTER CHNUM_PLACEHOLDER — CHTITLE_PLACEHOLDER (role: ROLE_PLACEHOLDER)
 SUBSECTION SUBNUM_PLACEHOLDER — SUBTITLE_PLACEHOLDER
-Expected purpose: PURPOSE_PLACEHOLDER
+What a section like this should do: PURPOSE_PLACEHOLDER
 What examiners check in this kind of chapter:
 CHECKS_PLACEHOLDER
 CURRENT YEAR: YEAR_PLACEHOLDER (Do not flag 2024-YEAR_PLACEHOLDER citations as "future" or "unpublished").
@@ -1326,9 +1373,10 @@ if the subsection is sound, return []. Prefer substantive issues (argument, evid
 method, interpretation) over wording, and do not repeat an issue that belongs to another section.
 
 Write as a senior supervisor speaking to the student about THEIR text: refer to their own
-headings, research questions, constructs and page content. Never mention this tool's internal
-terms ("thesis spine", "expected purpose", "golden-thread map", "subsection audit", "placeholder").
-The spine and map above were extracted automatically and may be incomplete: a field reading
+headings, chapters, research questions, constructs and page content (e.g. "your RQ2", "Chapter 1,
+section 1.7"). Never refer to the summaries above as documents — no "thesis spine", "map",
+"expected purpose", "subsection audit" or "placeholder".
+The summaries above were extracted automatically and may be incomplete: a field reading
 NOT FOUND means the extraction missed it, NOT that the thesis lacks it. Only say something is
 missing from the thesis if the text you are reading shows that it is.
 Return a JSON array; each element:
