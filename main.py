@@ -3192,7 +3192,7 @@ async def health():
         "claude_available":      claude_client is not None,
         "claude_model":          CLAUDE_MODEL,
         "literature_source":     "openalex" if OPENALEX_API_KEY else "crossref",
-        "version":               "4.2.0",
+        "version":               "4.2.1",
         "outputs": ["1_Examiner_Audit_Report.pdf","2_Annotated_Thesis.(docx|pdf)",
                     "3_Commentary_Report.pdf","4_Alignment_Matrix_Report.pdf"],
     }
